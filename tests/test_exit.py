@@ -94,6 +94,10 @@ def _handler_closes_everything(topology):
         # (the accepting thread ends once the lower-index leaders have dialed)
         assert sorted(_native_threads()) == ["gb-tcp-recv"] * 2 + ["gb-tcp-send"] * 2
     assert any(t.name == "gpubridge-async" for t in threading.enumerate())
+    # Neither rank closes before the other has looked: a leader that closes ends the
+    # other's receiving threads (they read the end of the stream and return), so the
+    # slower rank would count two threads, not four. Through the store, not the bridge.
+    gpubridge.barrier()
     gpubridge._at_exit()
     assert not gpubridge.is_initialized() and not dist.is_initialized()
     assert bridge.telemetry()["state"] == "closed"

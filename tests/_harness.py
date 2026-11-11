@@ -32,16 +32,32 @@ TIMEOUT = timedelta(seconds=60)
 GLOO_THREADS = ("pt_gloo_runloop", "gloo_tcp_loop")
 
 
+#: The kernel's flag for a task that has begun to exit (``PF_EXITING``, include/linux/sched.h).
+_PF_EXITING = 0x4
+
+
 def thread_names() -> list[str]:
-    """The kernel's name for every thread of this process (Linux; empty elsewhere)."""
+    """The kernel's name for every thread of this process that can still run code
+    (Linux; empty elsewhere).
+
+    A thread that has just been joined can stay listed for a moment: the kernel wakes
+    the joiner before it takes the task out of ``/proc``. Such a task is past its last
+    instruction of ours and has ``PF_EXITING`` set, so it is left out. Measured: 2 of
+    3000 closes of a TCP worker pair still listed a joined ``gb-tcp-send`` thread, both
+    with the flag, gone within 2 ms. A thread merely asked to stop doesn't have it."""
     names: list[str] = []
     if not Path("/proc/self/task").is_dir():
         return names
     for task in Path("/proc/self/task").iterdir():
         try:
-            names.append((task / "comm").read_text().strip())
+            name = (task / "comm").read_text().strip()
+            stat = (task / "stat").read_text()
         except OSError:  # the thread ended while we were reading
             continue
+        # "pid (comm) state ppid pgrp session tty tpgid flags ...": comm may hold spaces.
+        flags = int(stat[stat.rindex(")") + 2:].split()[6])
+        if not flags & _PF_EXITING:
+            names.append(name)
     return names
 
 
