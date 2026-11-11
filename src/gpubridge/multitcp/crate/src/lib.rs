@@ -1,4 +1,5 @@
-//! Multi-stream TCP messaging for gpubridge's `bridge="multitcp"` (docs/RUST_TRANSPORT.md).
+//! Multi-stream TCP messaging for gpubridge's `bridge="tcp"` (docs/RUST_TRANSPORT.md), the
+//! bridge `bridge="auto"` runs on without RDMA; `"multitcp"` is its older name.
 //!
 //! A [`Worker`] is one bridge member's end: a listening socket, and `streams` TCP
 //! connections to every other member (the member with the lower index dials). A message
@@ -23,6 +24,29 @@
 //! The C functions below are what gpubridge.multitcp loads with ctypes. Every one catches
 //! panics, so a bug here can't unwind into Python. Not thread-safe across callers: one
 //! Python thread drives a worker, as the bridge does.
+//!
+//! # Threads never touch Python
+//!
+//! The rule, for every thread this crate starts (`gb-tcp-accept`, and per connection
+//! `gb-tcp-send` and `gb-tcp-recv`): **it never calls into Python and never holds, reads
+//! or releases a Python object.** That is what lets a job on this bridge exit cleanly: a
+//! native thread that needs the interpreter's lock (the GIL) while the interpreter
+//! finalizes is ended by CPython 3.12 in the middle of its work, which is how a Gloo
+//! worker thread aborts a process at exit. No thread here can ever need the GIL:
+//!
+//! - the interface takes no callback: no `gb_tcp_*` function has a function-pointer
+//!   parameter, so there is nothing of Python's for a thread to call;
+//! - the crate depends on the standard library only and links no Python library;
+//! - what a thread sees of the caller is the raw byte range of a posted operation (a
+//!   pointer and a length, never a tensor or any other object), and it reads or writes
+//!   that range only between the post and the wait that reports the operation finished
+//!   or failed.
+//!
+//! `gb_tcp_close` and `gb_tcp_abort` join every sending and receiving thread before they
+//! return (`Worker::stop`). gpubridge closes the bridge in `destroy()`, and from an exit
+//! handler for a job that never called it, so those threads are gone before the
+//! interpreter finalizes. `tests/test_native_threads.py` checks the rule against the
+//! source and the built library.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -208,9 +232,12 @@ impl Worker {
             last_error: CString::default(),
         };
         let (shared, accepted) = (worker.shared.clone(), worker.accepted.clone());
-        worker.acceptor = Some(thread::spawn(move || {
-            accept_loop(listener, index, streams, shared, accepted)
-        }));
+        worker.acceptor = Some(
+            named("gb-tcp-accept", move || {
+                accept_loop(listener, index, streams, shared, accepted)
+            })
+            .map_err(|e| format!("starting the accepting thread: {e}"))?,
+        );
         Ok(worker)
     }
 
@@ -301,12 +328,16 @@ impl Worker {
             let writer = socket.try_clone().map_err(|e| e.to_string())?;
             self.sockets.push(socket); // first, so stop() can always shut it down
             let shared = self.shared.clone();
-            self.threads.push(thread::spawn(move || {
+            let sender = named("gb-tcp-send", move || {
                 send_loop(writer, queue, member, shared)
-            }));
-            let shared = self.shared.clone();
+            });
+            // Kept even if the next one fails to start: stop() joins what did.
             self.threads
-                .push(thread::spawn(move || recv_loop(reader, member, shared)));
+                .push(sender.map_err(|e| format!("starting a sending thread: {e}"))?);
+            let shared = self.shared.clone();
+            let receiver = named("gb-tcp-recv", move || recv_loop(reader, member, shared));
+            self.threads
+                .push(receiver.map_err(|e| format!("starting a receiving thread: {e}"))?);
         }
         self.shared.lock().connected[member] = true;
         Ok(())
@@ -477,6 +508,15 @@ impl Worker {
     }
 }
 
+/// Start a thread the system knows by `name` (at most 15 bytes on Linux), so a thread
+/// listing or a backtrace says whose it is.
+fn named<F>(name: &str, run: F) -> std::io::Result<JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::Builder::new().name(name.to_string()).spawn(run)
+}
+
 /// Files the `index * streams` connections the lower-index members dial. A hello naming
 /// this member or a higher one, an unknown connection number, or a connection already
 /// filed is dropped, so a stray or repeated dial can't take a real one's place.
@@ -630,7 +670,7 @@ fn write_c(text: &str, out: *mut c_char, size: usize) {
     let n = bytes.len().min(size - 1);
     // SAFETY: the caller passes a buffer of `size` bytes.
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), n);
         *out.add(n) = 0;
     }
 }

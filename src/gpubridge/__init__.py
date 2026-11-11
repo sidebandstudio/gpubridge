@@ -13,6 +13,8 @@ DistributedDataParallel can sync gradients through gpubridge with
 
 from __future__ import annotations
 
+import atexit
+import logging
 import os
 from datetime import timedelta
 from typing import Any
@@ -72,6 +74,7 @@ _torch_backend.register()  # backend="gpubridge" for torch.distributed, and solo
 batch_isend_irecv = _torch_backend.batch_isend_irecv
 
 __version__ = "0.4.0a0"
+_log = logging.getLogger("gpubridge")
 
 __all__ = [
     "batch_isend_irecv",
@@ -213,11 +216,20 @@ def init(
 
 
 def destroy() -> None:
-    """Tear down every process group created by :func:`init`.
+    """Tear down every process group created by :func:`init`, and close the bridge.
 
     Queued async collectives run first. Does nothing if gpubridge is not initialized.
+    A script that never calls it is covered at interpreter exit: an exit handler then
+    closes the bridge, which joins its native threads, without running queued work.
+
+    In a forked child (a ``DataLoader`` worker, say) the job belongs to the parent:
+    this only forgets the child's copy of gpubridge's state. It closes nothing and
+    destroys no process group, since the sockets and device handles are the parent's.
     """
     if not is_initialized():
+        return
+    if not _topology.owned():
+        _forget()
         return
     try:
         _release()
@@ -230,10 +242,21 @@ def destroy() -> None:
         dist.destroy_process_group()
 
 
+def _forget() -> None:
+    """Drop this process's gpubridge state without closing anything: a forked child's
+    copy of what its parent set up."""
+    _work.forget()
+    _topology._set_topology(None)
+    _observe._reset()
+
+
 def _release(drain: bool = True) -> None:
     """Release gpubridge's state, but not the process groups: :func:`destroy` destroys
     them after, and under the torch.distributed backend ``destroy_process_group()``
     does (before, so there queued collectives fail instead: ``drain=False``)."""
+    if not _topology.owned():  # a forked child: nothing here is its own to close
+        _forget()
+        return
     topology = get_topology()
     try:
         if drain:
@@ -246,3 +269,38 @@ def _release(drain: bool = True) -> None:
     topology.policy.close()
     if topology.bridge is not None:
         topology.bridge.close()
+
+
+def _at_exit() -> None:
+    """Close what a script that never called :func:`destroy` (or
+    ``destroy_process_group()``) left open, before the interpreter finalizes.
+
+    Closing the bridge joins its native threads, and stopping the async worker ends
+    gpubridge's own thread, so none of them is alive while the interpreter is torn
+    down. Queued async collectives are not run (their peers may be gone): they fail.
+    gpubridge's own waits here have limits, and nothing raises.
+
+    - After :func:`destroy`, or with nothing initialized: nothing to do.
+    - In a forked child: nothing. The job is the parent's (see :func:`destroy`).
+    - On a job without Gloo, whose default group is gpubridge's own, the process
+      groups are destroyed too, as ``destroy()`` would have: subgroups' bridges and
+      point-to-point lanes close with them.
+    - With ``bridge="gloo"`` only gpubridge's own state is released: torch's Gloo
+      groups are left as a script that forgot ``destroy()`` always left them.
+    """
+    if not _topology.owned():
+        return
+    try:
+        topology = get_topology()
+        ours = dist.is_initialized() and isinstance(
+            dist.distributed_c10d._get_default_group(), _torch_backend.GpubridgeProcessGroup)
+        if ours and topology.gloo_free:
+            dist.destroy_process_group()  # shutdown() releases gpubridge's state
+        if is_initialized():
+            _release(drain=False)
+    except Exception as exc:  # noqa: BLE001 - never turn a clean exit into a failed one
+        _log.warning("gpubridge: closing at interpreter exit failed: %s: %s",
+                     type(exc).__name__, exc)
+
+
+atexit.register(_at_exit)

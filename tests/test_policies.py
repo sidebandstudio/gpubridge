@@ -89,17 +89,27 @@ def _count_island_ops(topology):
     import torch.distributed as dist
 
     calls = []
-    for name in ("all_reduce", "reduce", "broadcast"):
-        real = getattr(dist, name)
-
-        def counting(tensor, *args, _name=name, _real=real, **kwargs):
+    names = ("all_reduce", "reduce", "broadcast")
+    reals = {name: getattr(dist, name) for name in names}
+    for name in names:
+        def counting(tensor, *args, _name=name, _real=reals[name], **kwargs):
             if kwargs.get("group") is topology.island_group:
                 calls.append((_name, kwargs.get("dst", kwargs.get("src"))))
             return _real(tensor, *args, **kwargs)
 
         setattr(dist, name, counting)
     tensor = rank_tensor((6,), torch.float32, topology.rank)
-    gpubridge.all_reduce(tensor)
+    try:
+        gpubridge.all_reduce(tensor)
+    finally:
+        # Put torch's functions back. Left on the module, the wrappers keep the topology,
+        # and with it a simulated island's Gloo group and its threads, alive until the
+        # interpreter finalizes, where a Gloo thread that has yet to release its last
+        # collective aborts the rank (torch's exit abort: 2 of 80 runs of [1+3] on
+        # Python 3.12 with torch 2.15). Released when the rank's function returns, the
+        # group joins its threads first.
+        for name in names:
+            setattr(dist, name, reals[name])
     assert torch.equal(tensor, expected_sum((6,), torch.float32, topology.world_size))
     leader = topology.island.leader
     # One reduce onto the leader, one broadcast from it; no island all_reduce.

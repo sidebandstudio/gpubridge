@@ -248,6 +248,13 @@ def shutdown() -> None:
         worker.close()
 
 
+def forget() -> None:
+    """Drop the worker without touching its thread or queue: for a forked child, which
+    inherited the object but not the thread."""
+    global _worker
+    _worker = None
+
+
 def abandon(timeout: float = 10.0) -> None:
     """Stop the worker thread without running what is queued: each queued collective
     fails. For teardown once the process groups are gone (the torch.distributed

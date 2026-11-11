@@ -6,6 +6,7 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import time
 import warnings
 from collections.abc import Iterator, Sequence
@@ -990,6 +991,16 @@ def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
 
 
 _current: Topology | None = None
+_owner_pid: int | None = None
+"""The process that built :data:`_current`. A forked child inherits the topology object
+but none of the threads behind its bridge, and shares its sockets and device handles
+with the parent: it must never close them (:func:`owned`)."""
+
+
+def owned() -> bool:
+    """Whether this process built the current topology (False in a forked child, and
+    when there is none): only then may it close the bridge's native resources."""
+    return _current is not None and _owner_pid == os.getpid()
 
 
 def get_topology() -> Topology:
@@ -1009,5 +1020,6 @@ def is_initialized() -> bool:
 
 
 def _set_topology(topology: Topology | None) -> None:
-    global _current
+    global _current, _owner_pid
     _current = topology
+    _owner_pid = os.getpid() if topology is not None else None

@@ -217,6 +217,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         self._p2p: _p2p.Engine | None = None
         self._p2p_lock = threading.Lock()
         self._p2p_store = dist.PrefixStore("gpubridge-p2p", store) if store is not None else None
+        self._pid = os.getpid()  # a forked child never closes what this process opened
 
     # ---- identity -------------------------------------------------------------------------
 
@@ -308,7 +309,7 @@ class GpubridgeProcessGroup(dist.ProcessGroup):
         (it goes in reverse order of group name, the world group last): release gpubridge's
         state without running anything still queued, and never raise. A subgroup closes
         its own topology's policy and bridge; torch destroys its groups."""
-        if self._p2p is not None:
+        if self._p2p is not None and os.getpid() == self._pid:
             self._p2p.close()
         if self._members:
             _close_subgroup(self)
@@ -888,8 +889,8 @@ def _close_subgroup(group: GpubridgeProcessGroup) -> None:
         if group in _subgroups:
             _subgroups.remove(group)
         sub, group._sub = group._sub, None
-    if sub is None:
-        return
+    if sub is None or os.getpid() != group._pid:
+        return  # nothing built, or a forked child: the bridge is its parent's to close
     topology = sub[0]
     try:
         topology.policy.close()
