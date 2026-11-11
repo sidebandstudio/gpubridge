@@ -159,9 +159,17 @@ every rank. gpubridge never changes the debug level. A level raised after
 stand in for NCCL ones; that torch treats an NCCL group the same way is read
 from its source (2.8.0 and 2.15.0), not shown on a GPU.
 
-A script that returns without calling `destroy()` is covered: an exit handler
-closes the bridge, which joins its native threads, before the interpreter
-finalizes.
+A script that returns without calling `destroy()` is covered at a normal
+exit: an exit handler closes the bridge, which joins its native threads,
+before the interpreter finalizes. That is best effort, not a guarantee: it runs
+at interpreter exit (an uncaught exception included) but not after `os._exit`,
+SIGKILL or a fatal abort; handlers registered after gpubridge was imported run
+before it; and it is not bounded in time. Draining pending work and the TCP
+bridge's accepting thread have deadlines (10 s or less), but the bridges'
+sending, receiving and completion threads are then joined without one, because
+they can still touch the caller's memory and are never detached. Closing the
+sockets and a stop flag are what end them; a device call that never returned
+would hold the exit. No teardown fault was injected on hardware.
 
 ## Install
 
@@ -672,7 +680,14 @@ rank, to one of gpubridge's two Rust bridges:
   (`tests/test_parity_fixture.py`: SHA-256 hashes generated once by the Gloo
   bridge, reproduced in jobs with no Gloo group). A floating-point SUM over
   three or more members that rounds is added in a ring order that is not
-  Gloo's, and can differ from it in the last bits.
+  Gloo's, and usually differs from it in the last bits (133 of the fixture's
+  160 such cases; the order the ring transports always used). The fixture is
+  all_reduce and broadcast between 2 to 4 one-rank islands on CPU: it says
+  nothing about other collectives, point-to-point, GPU paths, NaN or infinity
+  handling, or speed (the CHANGELOG lists what it leaves out).
+- **A library to build.** A mixed job's island leaders need the TCP bridge's
+  Rust library (built with cargo on first use, or `GPUBRIDGE_MULTITCP_LIB`),
+  where the Gloo bridge needed nothing beyond torch.
 - **What ran where.** As the default, with gpubridge's own default group, the
   Rust bridges have run on CPU only. Earlier, by name: the TCP bridge between
   two machines (a V100 and an MI50), the verbs bridge on one node through one

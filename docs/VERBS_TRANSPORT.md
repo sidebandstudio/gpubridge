@@ -461,7 +461,11 @@ to it or part-way fail at once with "member N closed its end of the bridge"
 operation is cancelled under the endpoint's lock (from then on nothing reads
 or writes caller memory), every queue pair moves to the error state, the
 completion thread takes the flushed completions until none is outstanding or
-the close's timeout passes, the thread stops, and the queue pairs close (A1's
+the close's timeout passes, the thread stops (it is then joined with no time
+limit of its own: the stop flag and its 100 ms poll are what end it, and it is
+never detached, since it can touch caller memory; a device call that never
+returned would hold the close, which no hardware test has provoked), and the
+queue pairs close (A1's
 drain-or-leak: work still outstanding keeps its slots registered and allocated,
 and the close says so). `abort` is the same without the goodbye or the release. When the drain
 times out, registrations still held by outstanding work are leaked too (never
@@ -758,8 +762,10 @@ references, not tensor bytes; users must budget outstanding tensor memory too.
 passes `gpubridge.verbs.availability()` (the library loads or builds, an
 endpoint opens on this process's `GPUBRIDGE_VERBS_*` settings: a device, an
 active port, an address; the MOCK test fabric never counts) and all leaders are
-on one link layer. Otherwise `auto` is the TCP bridge. A job on verbs creates no
-Gloo group. `device_tensors` is True: GPU
+on one link layer. Otherwise `auto` is the TCP bridge. A job on verbs creates no Gloo group (torch would add Gloo helper groups to the
+islands at its debug level DETAIL, so `init()` refuses that level unless the job
+sets `allow_debug_gloo` / `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`: RUNTIME_INVENTORY.md,
+section 6). `device_tensors` is True: GPU
 leaders hand GPU tensors straight to it, and it moves them direct or staged
 (["GPU memory"](#gpu-memory)). Its collectives are
 `gpubridge.tagged.TaggedBridge`'s, shared with `bridge="multitcp"`: with two

@@ -816,7 +816,12 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     control. *Status: on CPU (Linux, Python 3.12.3, torch 2.15.0) the TCP arm
     had no bad exit in 300 repetitions with and without `destroy()`; the
     CHANGELOG has both arms' counts. Never run on a GPU: whether NCCL's or
-    RCCL's own threads can need the GIL at exit is not established.* *Step:*
+    RCCL's own threads can need the GIL at exit is not established. Teardown
+    under a fault is not tested on hardware either: closing joins the TCP
+    bridge's sending and receiving threads and the verbs bridge's completion
+    thread with no time limit (they are never detached), so a device or driver
+    call that never returns, a peer or a store lost during close, and a
+    device's asynchronous events at destruction are all open.* *Step:*
     none yet.
 
 50. **The Rust bridges give Gloo's results on GPUs.** On CPU every bridge

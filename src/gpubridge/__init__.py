@@ -329,7 +329,25 @@ def _at_exit() -> None:
     Closing the bridge joins its native threads, and stopping the async worker ends
     gpubridge's own thread, so none of them is alive while the interpreter is torn
     down. Queued async collectives are not run (their peers may be gone): they fail.
-    gpubridge's own waits here have limits, and nothing raises.
+
+    Best effort, and not bounded in time:
+
+    - Some waits here have deadlines: the async worker is given 10 s, the TCP bridge's
+      accepting thread and the verbs bridge's drain of pending work at most 10 s (less
+      with a shorter job timeout), a point-to-point watcher 1 s. The joins after them
+      have none, on purpose: the TCP bridge's sending and receiving threads and the
+      verbs bridge's completion thread can still touch memory the caller owns, so
+      they are joined, never detached, however long that takes. Shutting the sockets
+      down and the stop flag are what end them; a device or driver call that never
+      returned would hold the exit. That has not been seen, and no teardown fault was
+      injected on hardware.
+    - Python exceptions raised while closing are logged, not raised; a blocked native
+      call can't be caught. If the policy's ``close()`` raises, the bridge after it is
+      not closed.
+    - It runs at a normal interpreter exit, an uncaught Python exception included.
+      ``os._exit``, SIGKILL and a fatal abort run no exit handler at all. Handlers
+      registered after gpubridge was imported run before this one, and Python's and
+      torch's own teardown after it; no order against every such hook is promised.
 
     - After :func:`destroy`, or with nothing initialized: nothing to do.
     - In a forked child: nothing. The job is the parent's (see :func:`destroy`).

@@ -302,7 +302,9 @@ unless it asks for one.** Read this before upgrading a job.
   docs/RUNTIME_INVENTORY.md, section 6, records the reversal of the 2026-10-20
   decision to keep Gloo, and what replaced each use of it.
 - **What you need to do.** The island leaders of a mixed job need the bridge's
-  Rust library: `python -m gpubridge.multitcp build` (cargo, no network), or
+  Rust library, where the Gloo bridge needed nothing beyond torch: a built
+  library, or cargo to build it on first use.
+  `python -m gpubridge.multitcp build` (cargo, no network), or
   `GPUBRIDGE_MULTITCP_LIB`; without it `init()` fails on every rank and says
   so. To keep a job exactly as it was, set `GPUBRIDGE_BRIDGE=gloo` (or pass
   `bridge="gloo"`). Code that relied on the default group being Gloo
@@ -327,7 +329,15 @@ unless it asks for one.** Read this before upgrading a job.
   - `gpubridge.destroy()` is no longer the only way out: an exit handler closes
     a bridge the script left open (joining the bridge's threads) before the
     interpreter finalizes, does nothing after `destroy()`, and nothing in a
-    forked child. The TCP library's threads are named (`gb-tcp-accept`,
+    forked child. It is best effort: it runs at a normal interpreter exit, not
+    after `os._exit`, SIGKILL or a fatal abort; handlers registered after
+    gpubridge was imported run before it; an exception from a policy's `close()`
+    leaves the bridge unclosed; and it is not bounded in time. Draining and the
+    TCP accepting thread have deadlines, but the TCP sending and receiving
+    threads and the verbs completion thread are joined without one, since they
+    can still touch the caller's memory and are never detached; a device call
+    that never returned would hold the exit. Teardown faults on hardware were
+    not tested. The TCP library's threads are named (`gb-tcp-accept`,
     `gb-tcp-send`, `gb-tcp-recv`); both Rust crates state, and
     `tests/test_native_threads.py` checks, that their threads never touch a
     Python object.
@@ -357,7 +367,17 @@ unless it asks for one.** Read this before upgrading a job.
     floating-point SUM in ring order, which is not Gloo's: on rounding data
     Gloo gave the ring's bits in 27 of 160 cases, so those 160 are
     pinned to the ring order instead, and the Gloo-generated ones use sums that
-    are exact. The file was generated on Linux aarch64; on x86-64, which was
+    are exact. **So this is not bit parity with Gloo everywhere: in 133 of the
+    160 order-sensitive cases with three or four leaders the default now gives
+    other last bits than the Gloo bridge did.** The order is the one the opt-in
+    ring transports (`multitcp`, `verbs`, `ucx`) always used, both results are
+    correct sums, and an NVIDIA + AMD job has two leaders, where it cannot
+    arise. The 1240 hashes are not a general numerical qualification. They do
+    not cover: all-gather, reduce-scatter and gather, point-to-point, GPU and
+    device paths, reductions inside an island or islands of unequal size, more
+    than four leaders, zero-sized or non-contiguous tensors, a broadcast from
+    any rank but the last, NaN, infinities and signed zeros, compression, or
+    speed. Other tests cover some of those. The file was generated on Linux aarch64; on x86-64, which was
     only emulated (qemu), the TCP bridge, the verbs bridge on its MOCK fabric
     and Gloo itself gave the same hashes (the UCX bridge was not built there).
   - The exit abort (`scripts/exit_abort.py`: four DDP ranks returning straight
@@ -368,7 +388,10 @@ unless it asks for one.** Read this before upgrading a job.
     exception"). The same with every rank calling `destroy()` first: 0 of 300
     on the TCP bridge and 0 of 300 on the control, so only the trial without
     `destroy()` shows that the test can see the abort.
-  - Found on the way and not fixed: on the UCX bridge (`bridge="ucx"`, opt-in)
+  - Found on the way and not fixed, a defect of the UCX bridge that is older
+    than this change (`auto` never selects UCX, so the default cannot meet it;
+    the exit handler can make a forgotten UCX teardown happen earlier than it
+    used to): on the UCX bridge (`bridge="ucx"`, opt-in)
     a leader that closes its bridge while another is still inside the job's
     last collective fails that one ("UCX peer failed ... Connection reset by
     remote peer"): 16 of 40 four-leader jobs that end with a large broadcast

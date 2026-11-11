@@ -18,8 +18,9 @@ abort a process at interpreter exit, after training has finished
 A job on this bridge creates no Gloo group: the bridge is not a process group,
 its rendezvous is the c10d store, and its threads never touch a Python object
 (["Threading"](#design)). (torch would add Gloo helper groups to the islands at
-its debug level DETAIL; `init()` refuses that unless the job opts in:
-RUNTIME_INVENTORY.md, section 6.) What it had to show to take Gloo's place is the same
+its debug level DETAIL; `init()` refuses that unless the job opts in with
+`allow_debug_gloo` / `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`: RUNTIME_INVENTORY.md,
+section 6.) What it had to show to take Gloo's place is the same
 results and no worse speed, not the 20% the first gate asked:
 
 - the same bits as the Gloo bridge: `tests/test_parity_fixture.py` (SHA-256 hashes
@@ -92,7 +93,11 @@ nothing of Python's, and sees only the raw byte ranges of posted operations.
 The rule is written in the crate's docs (`src/lib.rs`, "Threads never touch
 Python") and checked by `tests/test_native_threads.py`. gpubridge closes the
 bridge in `destroy()`, and from an exit handler for a script that never called
-it, so the threads are joined before the interpreter is torn down.
+it, so the threads are joined before the interpreter is torn down. The handler
+is best effort (it does not run after `os._exit`, SIGKILL or a fatal abort), and
+those joins have no time limit: only the accepting thread is given a deadline
+(below), because the sending and receiving threads can still touch the caller's
+memory and are never detached.
 
 **Point-to-point.** The torch backend's cross-island `send` and `recv` (and CPU
 tensors on a GPU job) run over lanes of this library too
