@@ -109,8 +109,11 @@ def _bridge_all_reduce(bridge: BridgeTransport, tensor: torch.Tensor, op: Reduce
 
 
 def _world(topology: Topology):
-    """The Gloo group of every rank (the default group unless the torch backend runs)."""
-    return topology.world_group if topology.world_group is not None else dist.group.WORLD
+    """A Gloo group of every member: the job's own with ``bridge="gloo"``, else one made
+    the first time ``flat-gloo`` is used (:func:`gpubridge.topology.gloo_world`)."""
+    from gpubridge.topology import gloo_world  # topology imports this module
+
+    return gloo_world(topology)
 
 
 def _native(topology: Topology) -> bool:
@@ -471,6 +474,11 @@ class FlatGloo(CollectivePolicy):
     @classmethod
     def applies_to(cls, layout: Layout) -> bool:
         return True
+
+    def setup(self, topology: Topology) -> None:
+        # On a bridge other than Gloo no Gloo group of every rank exists: asking for
+        # this policy is what creates one, here at init() rather than mid-training.
+        _world(topology)
 
     def all_reduce(self, tensor: torch.Tensor, topology: Topology,
                    op: ReduceOp.RedOpType = ReduceOp.SUM) -> None:

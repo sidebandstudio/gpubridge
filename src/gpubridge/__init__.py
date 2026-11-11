@@ -20,6 +20,7 @@ import torch.distributed as dist
 from torch.distributed import ReduceOp
 
 from gpubridge import observe as _observe
+from gpubridge import rendezvous as _rendezvous
 from gpubridge import topology as _topology
 from gpubridge import work as _work
 from gpubridge.collectives import (
@@ -64,7 +65,7 @@ from gpubridge.work import Work
 # (gpubridge.transport._BUILT_IN): importing gpubridge doesn't load them.
 from gpubridge import torch_backend as _torch_backend  # noqa: E402
 
-_torch_backend.register()  # backend="gpubridge" for torch.distributed
+_torch_backend.register()  # backend="gpubridge" for torch.distributed, and solo islands
 batch_isend_irecv = _torch_backend.batch_isend_irecv
 
 __version__ = "0.4.0a0"
@@ -122,17 +123,22 @@ def init(
     ``torch.distributed.init_process_group``. With none given, the ``env://``
     variables set by torchrun are used (MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE).
 
-    gpubridge owns the default process group: it is a Gloo group over all
-    ranks, used for discovery and :func:`barrier`. During discovery every rank
-    shares its :func:`probe` results and any problems that would stop it from
-    joining, so a rank without a GPU or a vendor fails ``init()`` on every rank
-    with one message instead of leaving the others waiting.
+    gpubridge owns the default process group. Before it exists, every rank shares
+    its :func:`probe` results and any problems that would stop it from joining
+    through the job's c10d store (discovery), so a rank without a GPU or a vendor
+    fails ``init()`` on every rank with one message instead of leaving the others
+    waiting. The default group is then gpubridge's own
+    (:class:`gpubridge.torch_backend.GpubridgeProcessGroup`: ``torch.distributed``
+    calls on it run through gpubridge), and :func:`barrier` counts through the
+    store: the job creates no Gloo group. Only ``bridge="gloo"`` makes the default
+    group a Gloo group of every rank, as every job's was before.
 
     Args:
         init_method: Rendezvous URL, e.g. ``env://``, ``tcp://host:port`` or ``file:///path``.
         rank: This process's global rank. Read from the environment if omitted.
         world_size: Total number of ranks. Read from the environment if omitted.
-        timeout: Timeout for every group gpubridge creates. None keeps PyTorch's default.
+        timeout: Timeout for every group gpubridge creates, and for discovery. None
+            keeps PyTorch's default (30 minutes).
         bridge: Transport between island leaders: a registered name or a
             :class:`BridgeTransport` subclass. Must be the same on every rank.
         policy: How collectives are put together: ``"auto"``, a registered
@@ -149,6 +155,7 @@ def init(
             if any rank reported a problem (no vendor, no GPU, no NCCL/RCCL
             backend), if ranks disagree on CPU mode, the bridge transport or the
             collective policy, or if the policy doesn't apply to the cluster.
+        TimeoutError: if a rank's discovery record doesn't arrive within ``timeout``.
         ValueError: for an unknown bridge or policy name, or invalid gpubridge env vars.
     """
     if is_initialized():
@@ -164,18 +171,23 @@ def init(
     # device (build_topology): a bad index then fails init() on every rank.
     local, config = _topology.describe_local(transport.name, chosen)
 
-    kwargs: dict[str, Any] = {}
-    if rank is not None:
-        kwargs["rank"] = rank
-    if world_size is not None:
-        kwargs["world_size"] = world_size
-    if timeout is not None:
-        kwargs["timeout"] = timeout
-    dist.init_process_group(backend=CPU_BACKEND, init_method=init_method, **kwargs)
+    # The store torch's own rendezvous would make, first: discovery runs on it before
+    # any process group exists, so what every rank reports decides the groups.
+    store, rank, world_size = _rendezvous.open_store(init_method, rank, world_size, timeout)
+    scope = f"world{next(_torch_backend._world_setups)}"
+    peers = _topology.discover(store, scope, rank, world_size, local, timeout)
+    _topology.validate_peers(peers, warn=rank == 0)
+
+    kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+    gloo = issubclass(transport, GlooTransport)
+    dist.init_process_group(backend=CPU_BACKEND if gloo else _torch_backend.NAME,
+                            store=dist.PrefixStore("default_pg", store), rank=rank,
+                            world_size=world_size, **kwargs)
     try:
-        topology = _topology.build_topology(
-            local, config, transport=transport, policy=chosen, timeout=timeout
-        )
+        if not gloo:
+            return _torch_backend.adopt(peers, config, transport, chosen, timeout, scope)
+        topology = _topology.build_topology(peers, config, transport=transport, policy=chosen,
+                                            timeout=timeout, scope=scope)
     except BaseException:
         dist.destroy_process_group()
         raise

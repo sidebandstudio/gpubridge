@@ -16,13 +16,13 @@ import weakref
 from collections.abc import Callable
 
 import torch
-import torch.distributed as dist
 from torch.distributed import ReduceOp
 
 from gpubridge import observe
 from gpubridge import work as _work
 from gpubridge.policies import CollectivePolicy, implements, policies_implementing
 from gpubridge.topology import Topology, get_topology
+from gpubridge.topology import barrier as _barrier
 from gpubridge.work import Work
 
 #: Dtypes every built-in path supports: Gloo (world group, bridge, CPU islands)
@@ -225,10 +225,14 @@ def barrier(*, async_op: bool = False, _topology: Topology | None = None) -> Wor
     """Block until every rank in the cluster reaches this call.
 
     On GPUs this first waits for the rank's queued device work, so collectives
-    issued before the barrier have finished locally when it returns.
+    issued before the barrier have finished locally when it returns. The barrier
+    itself is a counter in the job's c10d store that every rank adds to and watches
+    (with ``bridge="gloo"``, a Gloo barrier).
 
     Raises:
         RuntimeError: if gpubridge is not initialized.
+        TimeoutError: if a rank doesn't reach it within the timeout ``init()`` gave
+            its groups (30 minutes without one).
     """
     topology = _topology or get_topology()
 
@@ -236,7 +240,7 @@ def barrier(*, async_op: bool = False, _topology: Topology | None = None) -> Wor
         with observe.collective(topology, "barrier"):
             if not topology.simulated:
                 torch.cuda.synchronize(topology.device)
-            dist.barrier(group=topology.world_group)
+            _barrier(topology)
 
     return _start(topology, "barrier", run, [], None, async_op)
 

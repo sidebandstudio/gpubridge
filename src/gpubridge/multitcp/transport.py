@@ -38,9 +38,15 @@ from typing import ClassVar
 
 from gpubridge import multitcp
 from gpubridge.config import parse_size
-from gpubridge.tagged import DEFAULT_TIMEOUT, HANDSHAKE, TaggedBridge, _pieces  # noqa: F401
+from gpubridge.rendezvous import wait_for as _wait_for
+from gpubridge.tagged import (  # noqa: F401 - tag: the tests' name for it
+    DEFAULT_TIMEOUT,
+    HANDSHAKE,
+    TaggedBridge,
+    _pieces,
+    tag,
+)
 from gpubridge.transport import register_transport
-from gpubridge.ucx.transport import _wait_for, tag  # noqa: F401 - tag: the tests' name for it
 
 #: Chunk size of every message, e.g. ``4M`` or ``65536``.
 CHUNK_BYTES_ENV = "GPUBRIDGE_MULTITCP_CHUNK_BYTES"

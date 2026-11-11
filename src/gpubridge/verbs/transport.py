@@ -79,10 +79,10 @@ from torch.distributed import ReduceOp
 
 from gpubridge import verbs
 from gpubridge.config import parse_size
-from gpubridge.tagged import TaggedBridge, _pieces
+from gpubridge.rendezvous import wait_for as _wait_for
+from gpubridge.tagged import _REDUCE, TaggedBridge, _pieces, _segments, tag
 from gpubridge.transport import register_transport
 from gpubridge.ucx import gdr
-from gpubridge.ucx.transport import _REDUCE, _segments, _wait_for, tag
 from gpubridge.verbs import observe
 from gpubridge.verbs.gpu import (
     DeviceSpan,

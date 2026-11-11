@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import gpubridge
@@ -24,6 +25,39 @@ from gpubridge.config import (
 
 # Fail a deadlocked test instead of hanging the suite.
 TIMEOUT = timedelta(seconds=60)
+#: The names of torch's Gloo threads: the worker that can abort a rank at interpreter
+#: exit on Python 3.12 (``pt_gloo_runloop``), and Gloo's TCP event loop.
+GLOO_THREADS = ("pt_gloo_runloop", "gloo_tcp_loop")
+
+
+def thread_names() -> list[str]:
+    """The kernel's name for every thread of this process (Linux; empty elsewhere)."""
+    names: list[str] = []
+    if not Path("/proc/self/task").is_dir():
+        return names
+    for task in Path("/proc/self/task").iterdir():
+        try:
+            names.append((task / "comm").read_text().strip())
+        except OSError:  # the thread ended while we were reading
+            continue
+    return names
+
+
+def gloo_groups() -> list[str]:
+    """Every process group torch knows in this process whose backend is Gloo."""
+    world = dist.distributed_c10d._world
+    return [f"{world.pg_names.get(pg)} ({backend})" for pg, (backend, _) in world.pg_map.items()
+            if str(backend) == "gloo"]
+
+
+def assert_no_gloo() -> None:
+    """This process holds no Gloo group, by torch's own table of groups (on every
+    platform and torch release), and on Linux no thread with one of Gloo's names
+    (which torch gives its Gloo threads from some release after 2.8.0)."""
+    assert gloo_groups() == []
+    if Path("/proc/self/task").is_dir():
+        found = [name for name in thread_names() if name in GLOO_THREADS]
+        assert found == [], f"Gloo threads in a job that didn't ask for Gloo: {found}"
 
 
 def run_ranks(

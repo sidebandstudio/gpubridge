@@ -48,28 +48,18 @@ from torch.distributed import ReduceOp
 
 from gpubridge import ucx
 from gpubridge.config import parse_size
+from gpubridge.rendezvous import DEFAULT_TIMEOUT  # noqa: F401 - this module's name for it
+from gpubridge.rendezvous import wait_for as _wait_for
 from gpubridge.staging import PinnedBridgeStaging
+from gpubridge.tagged import _REDUCE, _segments, tag  # noqa: F401 - shared with the Rust bridges
 from gpubridge.transport import BridgeTransport, register_transport, scoped_name
 from gpubridge.ucx import gdr
 
 #: Chunk size of every UCX message, e.g. ``4M`` or ``65536``.
 CHUNK_BYTES_ENV = "GPUBRIDGE_UCX_CHUNK_BYTES"
 DEFAULT_CHUNK_BYTES = 4 * 2**20
-#: The deadline when ``init()`` gave none: torch's default group timeout.
-DEFAULT_TIMEOUT = timedelta(minutes=30)
 #: The tag step of the connection handshake.
 HANDSHAKE = 0xFFF
-
-_REDUCE = {ReduceOp.SUM: torch.Tensor.add_,
-           ReduceOp.MAX: lambda a, b: torch.maximum(a, b, out=a),
-           ReduceOp.MIN: lambda a, b: torch.minimum(a, b, out=a)}
-
-
-def tag(seq: int, step: int, sender: int, chunk: int) -> int:
-    """A 64-bit message tag: collective number, step, sending member, chunk."""
-    return ((seq & 0xFFFFFF) << 40) | ((step & 0xFFF) << 28) | ((sender & 0xFF) << 20) | (
-        chunk & 0xFFFFF)
-
 
 def chunk_bytes_setting() -> int:
     raw = os.environ.get(CHUNK_BYTES_ENV, "").strip()
@@ -103,13 +93,6 @@ def choose_path(device_type: str, hip: bool, memory_types: set[str]) -> tuple[st
     if kind in memory_types:
         return "direct", memory
     return "staged", ucx.HOST
-
-
-def _segments(numel: int, parts: int) -> list[tuple[int, int]]:
-    """(start, length) in elements of ``parts`` near-equal segments."""
-    base, extra = divmod(numel, parts)
-    bounds = list(itertools.accumulate([base + (i < extra) for i in range(parts)], initial=0))
-    return [(bounds[i], bounds[i + 1] - bounds[i]) for i in range(parts)]
 
 
 @register_transport
@@ -363,18 +346,3 @@ class UcxTransport(BridgeTransport):
         from gpubridge.ucx.p2p import UcxLink
 
         return UcxLink(dist.get_rank(), store, timeout or DEFAULT_TIMEOUT)
-
-
-def _wait_for(store, keys: list[str], deadline: float, what: str,
-              failures: Sequence[str] = ()) -> list[str]:
-    """The values of ``keys`` once all exist. Gives up at ``deadline``, or as soon as one of
-    ``failures`` (a member's status key) holds an error."""
-    while True:
-        if store.check(keys):
-            return [store.get(k).decode() for k in keys]
-        for failure in failures:
-            if store.check([failure]) and store.get(failure).decode() != "ok":
-                raise RuntimeError(f"a bridge member failed first: {store.get(failure).decode()}")
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"timed out waiting for {what}")
-        time.sleep(0.01)

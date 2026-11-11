@@ -489,6 +489,70 @@ def test_a_setting_that_differs_fails_the_first_collective_on_every_rank(tmp_pat
                 env={0: {POLICY_ENV: "flat-gloo"}, -1: {}})
 
 
+@gpubridge.register_policy
+class Failing(gpubridge.policies.ReduceBridgeBroadcast):
+    """A policy whose all_reduce fails on every rank, as a lost bridge peer would."""
+
+    name = "test-failing"
+
+    def all_reduce(self, tensor, topology, op=None):
+        raise ZeroDivisionError("policy bug")
+
+
+def _a_failed_collective_raises(rank, world):
+    dist.barrier()
+    t = torch.ones(3)
+    # The call that failed raises, not only the one after it: torch's own Work for a
+    # Python backend would return from wait() as if the collective had worked.
+    with pytest.raises(RuntimeError, match="all_reduce failed: policy bug"):
+        dist.all_reduce(t)
+    # And every later collective on this rank refuses to start, sync or async, whatever
+    # torch function asks.
+    refused = "an earlier async gpubridge collective failed"
+    with pytest.raises(RuntimeError, match=refused):
+        dist.all_reduce(t)
+    with pytest.raises(RuntimeError, match=refused):
+        dist.all_gather([torch.zeros(1) for _ in range(world)], torch.ones(1))
+    with pytest.raises(RuntimeError, match=refused):
+        dist.broadcast(t, src=0, async_op=True)
+    with pytest.raises(RuntimeError, match=refused):
+        dist.barrier()
+
+
+def test_a_failed_collective_raises_from_the_torch_call_that_made_it(tmp_path):
+    run_backend(TWO_TWO, _a_failed_collective_raises, tmp_path,
+                env={-1: {POLICY_ENV: "test-failing"}})
+
+
+def _an_async_failure_raises_from_wait(rank, world):
+    dist.barrier()
+    work = dist.all_reduce(torch.ones(3), async_op=True)
+    with pytest.raises(RuntimeError, match="all_reduce failed: policy bug"):
+        work.wait()
+    assert work.is_completed() and not work.is_success()
+    assert isinstance(work.exception(), ZeroDivisionError)
+
+
+def test_an_async_collectives_failure_raises_from_its_wait(tmp_path):
+    run_backend(TWO_TWO, _an_async_failure_raises_from_wait, tmp_path,
+                env={-1: {POLICY_ENV: "test-failing"}})
+
+
+def _ddp_without_a_hook_fails_by_the_next_collective(rank, world):
+    # DDP's reducer is C++: it gets the kind of Work C++ can hold, whose wait() doesn't
+    # raise. The failure then stops the job at this rank's next collective at the
+    # latest, never later.
+    model = nn.parallel.DistributedDataParallel(_integer_model())
+    with pytest.raises(RuntimeError, match="policy bug|an earlier async gpubridge collective"):
+        model(_batch(rank, 0)).sum().backward()
+        dist.barrier()
+
+
+def test_ddp_without_a_comm_hook_fails_by_the_collective_after_a_failed_one(tmp_path):
+    run_backend(TWO_TWO, _ddp_without_a_hook_fails_by_the_next_collective, tmp_path,
+                env={-1: {POLICY_ENV: "test-failing"}})
+
+
 def _two_jobs_in_a_row(rank, world):
     t = rank_tensor((3,), torch.float32, rank)
     dist.all_reduce(t)
@@ -806,8 +870,8 @@ def test_world_setups_use_fresh_transport_store_names():
     from gpubridge.transport import scoped_name
 
     names = []
-    for _ in range(2):
-        with torch_backend._world_group_names():
+    for _ in range(2):  # as setup() and gpubridge.init() name each world setup
+        with topology.setup_names(f"gpubridge:world{next(torch_backend._world_setups)}"):
             names.append(scoped_name([0, 1]))
     assert all(names) and names[0] != names[1]
     assert scoped_name([0, 1]) is None

@@ -48,10 +48,14 @@ BRIDGE_COMPRESSION_MODES = ("bf16", "fp8")
 POLICY_ENV = "GPUBRIDGE_POLICY"
 BRIDGE_ENV = "GPUBRIDGE_BRIDGE"
 
-#: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
+#: torch's CPU backend: ``bridge="gloo"``'s groups, the ``flat-gloo`` policy's, and
+#: islands of several ranks in CPU simulation. No other job creates a group on it.
 CPU_BACKEND = "gloo"
 #: Backend of islands on real GPUs. On ROCm builds of PyTorch, "nccl" runs RCCL.
 GPU_BACKEND = "nccl"
+#: Backend of a one-rank island in CPU simulation on a bridge other than Gloo: a Python
+#: group with nothing behind it (:class:`gpubridge.torch_backend.SoloGroup`).
+SOLO_BACKEND = "gpubridge_solo"
 
 
 def _flag(name: str) -> bool:
@@ -185,7 +189,8 @@ class Config:
     """How this process communicates, resolved once by :func:`gpubridge.init`."""
 
     simulated: bool
-    """True on CPU with Gloo islands: simulation mode or CPU-only mode."""
+    """True on CPU, in simulation mode or CPU-only mode: islands are then Gloo groups
+    (one-rank islands on a bridge other than Gloo: no backend at all)."""
     island_backend: str
     device: torch.device
 

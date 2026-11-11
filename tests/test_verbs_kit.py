@@ -578,7 +578,9 @@ def checked_init(**kwargs):
     assert config.device == torch.device("cpu") and config.island_backend == "gloo"
     assert not dist.is_initialized()
     topology = original_init(**kwargs)
-    assert dist.get_backend() == "gloo"
+    # A verbs job didn't ask for Gloo: its default group is gpubridge's own. The
+    # islands of several CPU ranks are Gloo groups, as host mode needs.
+    assert dist.get_backend() == "gpubridge"
     assert dist.get_backend(topology.island_group) == "gloo"
     assert topology.config == config
     assert topology.transport is VerbsTransport

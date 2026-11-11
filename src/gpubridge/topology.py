@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import json
+import time
 import warnings
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
@@ -16,12 +17,14 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from gpubridge import rendezvous as _rendezvous
 from gpubridge.config import (
     BRIDGE_COMPRESSION_ENV,
     CPU_BACKEND,
     CPU_ONLY_ENV,
     GPU_BACKEND,
     PINNED_STAGING_ENV,
+    SOLO_BACKEND,
     SPLIT_TEST_ENV,
     VENDOR_ENV,
     Config,
@@ -35,7 +38,7 @@ from gpubridge.config import (
 from gpubridge.detect import Probe, detect_vendor, probe
 from gpubridge.policies import AUTO, CollectivePolicy, choose_policy, policy_name
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
-from gpubridge.transport import BridgeTransport
+from gpubridge.transport import BridgeTransport, GlooTransport
 from gpubridge.transport import _scope as _transport_scope
 
 
@@ -155,7 +158,7 @@ class PeerInfo:
         return self.probe.torch_version
 
     def to_wire(self) -> dict[str, Any]:
-        """Plain builtins for all_gather_object, so ranks only need to agree on pickling those."""
+        """Plain builtins, for the discovery record every rank publishes as JSON."""
         return asdict(self)
 
     @classmethod
@@ -361,10 +364,19 @@ class Topology:
     timeout: timedelta | None = None
     """The timeout ``init()`` gave its groups, for groups a policy creates in ``setup()``."""
     world_group: ProcessGroup | None = None
-    """Under the torch.distributed backend, where the default group is the backend itself:
-    a Gloo group of every rank for discovery, :func:`gpubridge.barrier` and ``flat-gloo``.
-    None after :func:`gpubridge.init`, whose default group is a Gloo one: they look it
-    up when used rather than hold it, so it goes when the job destroys it."""
+    """A Gloo group of every member, where the job created one at setup: under the
+    torch.distributed backend with ``bridge="gloo"`` (for :func:`gpubridge.barrier`,
+    ``flat-gloo`` and point-to-point). None otherwise: on any other bridge no Gloo group
+    of every rank exists (``barrier()`` then counts through the c10d store, and
+    ``flat-gloo`` makes its own group when it is first used: :func:`gloo_world`); and
+    after :func:`gpubridge.init` with ``bridge="gloo"``, whose default group is the Gloo
+    one, looked up when used rather than held, so it goes when the job destroys it."""
+    scope: str = "world0"
+    """Names this topology in the c10d store, the same on every member and unique in the
+    job: ``world<n>`` for the n-th setup in this process, a subgroup's own name."""
+    state: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    """What this topology makes after setup: its barrier count, a Gloo group that
+    ``flat-gloo`` asked for. Not part of its identity."""
 
     @property
     def policy_name(self) -> str:
@@ -389,8 +401,16 @@ class Topology:
 
     @property
     def bridge_group(self) -> ProcessGroup | None:
-        """The bridge's process group, if its transport has one (the default Gloo one does)."""
+        """The bridge's process group, if its transport has one (``bridge="gloo"`` does)."""
         return getattr(self.bridge, "group", None)
+
+    @property
+    def gloo_free(self) -> bool:
+        """Whether this topology was set up without asking for Gloo: any bridge transport
+        that isn't Gloo's. Its islands are then native groups, or in CPU simulation a
+        :class:`~gpubridge.torch_backend.SoloGroup` for a one-rank island (a multi-rank
+        island there is still a Gloo group: simulation is a test device)."""
+        return self.transport is None or not issubclass(self.transport, GlooTransport)
 
     @property
     def world_size(self) -> int:
@@ -500,40 +520,74 @@ def _gpu_clash_error(lines: Sequence[str], split: str) -> str:
             + "\n".join(lines) + "\n" + hint)
 
 
+def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | None,
+             timeout: timedelta | None, *, problem: str | None = None) -> tuple[PeerInfo, ...]:
+    """Exchange every rank's :class:`PeerInfo` through the c10d store.
+
+    Collective over the job: every rank publishes its record under ``scope`` and reads
+    all of them, so no process group has to exist yet. A rank that could not even
+    describe itself passes ``problem`` instead of ``local``: every rank then raises
+    with it, instead of that rank exiting alone and the others waiting.
+
+    Raises:
+        RuntimeError: if any rank published a problem, or a record of another version.
+        TimeoutError: if a rank's record doesn't arrive in ``timeout`` (30 minutes if None).
+    """
+    deadline = time.monotonic() + (timeout or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
+    record: dict[str, Any] = {"v": _rendezvous.RECORD_VERSION}
+    if problem is None:
+        assert local is not None
+        record["peer"] = local.to_wire()
+    else:
+        record["error"] = problem
+    records = _rendezvous.exchange(store, f"gpubridge/{scope}/peer", rank, world_size, record,
+                                   deadline, "every rank's discovery record")
+    failing = [(r, rec.get("error") or f"its gpubridge writes discovery record version "
+                f"{rec.get('v')!r}, this one version {_rendezvous.RECORD_VERSION}")
+               for r, rec in enumerate(records)
+               if rec.get("error") or rec.get("v") != _rendezvous.RECORD_VERSION]
+    if failing:
+        raise RuntimeError(
+            f"gpubridge cannot start: {len(failing)} of {world_size} ranks reported "
+            "problems.\n" + "\n".join(f"  rank {r}: {p}" for r, p in failing))
+    return tuple(PeerInfo.from_wire(rec["peer"]) for rec in records)
+
+
 def build_topology(
-    local: PeerInfo,
+    peers: Sequence[PeerInfo],
     config: Config,
     *,
     transport: type[BridgeTransport],
     policy: str | type[CollectivePolicy] = AUTO,
     timeout: timedelta | None = None,
     world_group: ProcessGroup | None = None,
+    scope: str = "world0",
 ) -> Topology:
-    """Exchange every rank's :class:`PeerInfo`, then create the island groups and the bridge.
+    """Create the island groups and the bridge from what every rank reported.
 
-    Collective: every rank must call this after the global Gloo group exists.
+    Collective: every rank calls this, with the same ``peers``, once a default
+    process group exists (it is what ``dist.new_group`` and the bridges' store come
+    from). Outside ``bridge="gloo"``, inside :func:`setup_names`.
 
     Args:
-        local: What this rank reports, from :func:`describe_local`.
+        peers: Every rank's :class:`PeerInfo` by global rank, from :func:`discover`,
+            which :func:`validate_peers` has accepted.
         config: This rank's resolved configuration.
-        transport: The bridge transport class; its name must match ``local.bridge``.
-        policy: ``"auto"`` or the collective policy class; its name must match
-            ``local.policy``.
+        transport: The bridge transport class every rank chose.
+        policy: ``"auto"`` or the collective policy class; its name is ``peers``'.
         timeout: Timeout for the new groups' collectives. None keeps PyTorch's default.
-        world_group: A Gloo group of every rank, for discovery, ``barrier()`` and
-            ``flat-gloo``. None means the default group, which ``init()`` makes a
-            Gloo one; the torch.distributed backend passes its own, since there
-            the default group is the backend itself.
+        world_group: A Gloo group of every rank the caller made for ``barrier()``,
+            ``flat-gloo`` and point-to-point, if it made one (see
+            :attr:`Topology.world_group`).
+        scope: The topology's name in the c10d store (:attr:`Topology.scope`).
 
     Raises:
-        RuntimeError: from :func:`validate_peers`, or if the policy doesn't apply
-            to the layout, on every rank alike.
+        RuntimeError: if two ranks of an island would share a GPU, or the policy
+            doesn't apply to the layout, on every rank alike.
     """
     rank = dist.get_rank()
-    gathered: list[Any] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local.to_wire(), group=world_group)  # None: the default
-    peers = tuple(PeerInfo.from_wire(info) for info in gathered)
-    validate_peers(peers, warn=rank == 0)
+    peers = tuple(peers)
+    local = peers[rank]
     if not config.simulated:
         # Only now that every rank's device index has passed discovery. Called
         # earlier, an index with no GPU behind it crashed one rank on its own.
@@ -556,12 +610,13 @@ def build_topology(
         raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
     policy_cls = choose_policy(policy, layout)
 
-    # Every rank visits the groups in the same order. Backend setup wraps this
-    # in _members_only: only a group's members create it and synchronize.
-    # Direct gpubridge.init() keeps torch's default whole-world synchronization.
+    # Every rank visits the groups in the same order. Inside setup_names only a
+    # group's members create it and synchronize; bridge="gloo" through
+    # gpubridge.init() keeps torch's default whole-world synchronization.
     island_group: ProcessGroup | None = None
     for island in layout.islands:
-        group = dist.new_group(list(island.ranks), timeout=timeout, backend=config.island_backend)
+        group = dist.new_group(list(island.ranks), timeout=timeout,
+                               backend=island_backend(config, island, transport))
         if rank in island.ranks:
             island_group = group
     bridge: BridgeTransport | None = None
@@ -585,9 +640,84 @@ def build_topology(
         transport=transport,
         timeout=timeout,
         world_group=world_group,
+        scope=scope,
     )
     topology.policy.setup(topology)
     return topology
+
+
+def island_backend(config: Config, island: Island, transport: type[BridgeTransport]) -> str:
+    """The backend of ``island``'s process group.
+
+    NCCL (RCCL on ROCm builds) on GPUs. In CPU simulation and CPU-only mode, a test
+    device: Gloo for an island of several ranks, and for a one-rank island
+    :data:`~gpubridge.config.SOLO_BACKEND`, a Python group with no backend library, no
+    connection and no thread (:class:`gpubridge.torch_backend.SoloGroup`), so a job of
+    one-rank islands on a bridge other than Gloo has no Gloo group at all. With
+    ``bridge="gloo"`` a one-rank island stays the Gloo group it always was.
+    """
+    if config.simulated and len(island.ranks) == 1 and not issubclass(transport, GlooTransport):
+        return SOLO_BACKEND
+    return config.island_backend
+
+
+def _default_is_gloo() -> bool:
+    """Whether the job's default group is a Gloo one (``gpubridge.init(bridge="gloo")``)."""
+    try:
+        return dist.get_backend() == CPU_BACKEND
+    except (RuntimeError, ValueError):
+        return False
+
+
+def gloo_world(topology: Topology) -> ProcessGroup:
+    """A Gloo group of every member of ``topology``: what ``flat-gloo`` runs on.
+
+    The one the job set up with ``bridge="gloo"`` where there is one. On any other
+    bridge none exists, and this creates one the first time it is asked, and keeps it:
+    naming ``flat-gloo`` (the policy, an ``auto-tuned`` rule, or the reference in a
+    test) is then what asks for Gloo. Collective over the topology's members, like the
+    collective that needs it: every member reaches its first ``flat-gloo`` call at the
+    same point.
+    """
+    if topology.world_group is not None:
+        return topology.world_group
+    if not topology.layout.ranks and _default_is_gloo():
+        return dist.group.WORLD
+    group = topology.state.get("gloo_world")
+    if group is None:
+        with setup_names(f"gpubridge:{topology.scope}.gloo"):
+            group = dist.new_group(list(topology.layout.members), timeout=topology.timeout,
+                                   backend=CPU_BACKEND)
+        topology.state["gloo_world"] = group
+    return group
+
+
+def barrier(topology: Topology) -> None:
+    """Block until every member of ``topology`` reaches this call.
+
+    A Gloo barrier where the job set up a Gloo group of every member
+    (``bridge="gloo"``); otherwise a counter in the c10d store that every member adds
+    to and watches (:func:`gpubridge.rendezvous.barrier`), with the deadline
+    ``init()`` gave its groups (30 minutes without one).
+
+    Raises:
+        TimeoutError: if a member doesn't arrive in time (the store barrier).
+    """
+    if topology.world_group is not None:
+        dist.barrier(group=topology.world_group)
+        return
+    if not topology.layout.ranks and _default_is_gloo():
+        dist.barrier()
+        return
+    count = topology.state.get("barriers", 0)
+    topology.state["barriers"] = count + 1
+    prefix = f"gpubridge/{topology.scope}/barrier"
+    first = topology.rank == topology.layout.members[0]
+    deadline = time.monotonic() + (topology.timeout
+                                   or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
+    _rendezvous.barrier(_rendezvous.default_store(), f"{prefix}/{count}",
+                        len(topology.layout.members), deadline,
+                        retire=f"{prefix}/{count - 1}" if first and count else None)
 
 
 def _subgroup_naming_problem() -> str | None:
@@ -692,9 +822,35 @@ def _members_only(prefix: str) -> Iterator[None]:
         dist.new_group, c10d._process_group_name = plain_new, plain_name  # type: ignore[assignment]
 
 
+def setup_names(prefix: str) -> contextlib.AbstractContextManager[None]:
+    """Name the groups created inside like a subgroup's (``{prefix}.{ranks}.{k}``,
+    :func:`_members_only`), not from torch's count of the groups each process has
+    created, and have only each group's own ranks create it.
+
+    The ranks can reach a setup having created different numbers of groups: torch
+    2.9.1's ``DeviceMesh`` creates one for a (2, 1) mesh's replicate dimension where
+    2.14.1's reuses the default group, groups of the gpubridge backend are created
+    without any exchange, and a one-rank island's group is created by that rank alone.
+    torch's names would then differ between the ranks, and they would wait on different
+    store keys until the timeout. On a torch whose private naming isn't what the patch
+    expects, torch's names are used as before, with a warning."""
+    problem = _subgroup_naming_problem()
+    if problem is None:
+        return _members_only(prefix)
+    warnings.warn(
+        f"gpubridge names its setup groups the way torch {torch.__version__} does ({problem}), "
+        "so every rank must have created the same number of groups before gpubridge sets "
+        "up, or setup waits until the timeout",
+        RuntimeWarning, stacklevel=3)
+    return contextlib.nullcontext()
+
+
 def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
-                      timeout: timedelta | None = None) -> tuple[Topology, ProcessGroup]:
-    """A subgroup's own topology, over its members only; and a Gloo group of them.
+                      timeout: timedelta | None = None
+                      ) -> tuple[Topology, ProcessGroup | None]:
+    """A subgroup's own topology, over its members only; and with ``bridge="gloo"`` a
+    Gloo group of them for CPU tensors (None on any other bridge, where the backend
+    carries those through the topology itself).
 
     Collective over the members (``ranks``, global, ascending), which must all
     call it, in the same order relative to other subgroups' setups; the rest of
@@ -703,9 +859,9 @@ def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
     discovery). Single-vendor members get ``native-only``; mixed members get
     the policy the job asked for, resolved for their layout, and the world's
     bridge transport over their own leaders. Groups are created in the same
-    order on every member: a Gloo group of the members (the subgroup's
-    ``world_group``), a second one for CPU tensors, the islands in leader
-    order, the bridge, then whatever the policy's ``setup()`` creates.
+    order on every member: with ``bridge="gloo"`` a Gloo group of the members (the
+    subgroup's ``world_group``) and a second one for CPU tensors; then the islands
+    in leader order, the bridge, then whatever the policy's ``setup()`` creates.
     """
     ranks = tuple(ranks)
     layout = plan_topology([world.layout.vendors[world.layout.index(r)] for r in ranks], ranks)
@@ -715,24 +871,28 @@ def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
     else:
         policy_cls = choose_policy(AUTO if asked == AUTO else type(world.policy), layout)
     rank = world.rank
+    assert world.transport is not None
     with _members_only(f"gpubridge:{name}"):
-        group = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
-        cpu = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
+        group = cpu = None
+        if not world.gloo_free:
+            group = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
+            cpu = dist.new_group(list(ranks), timeout=timeout, backend=CPU_BACKEND)
         island_group: ProcessGroup | None = None
         for island in layout.islands:
-            created = dist.new_group(list(island.ranks), timeout=timeout,
-                                     backend=world.config.island_backend)
+            created = dist.new_group(
+                list(island.ranks), timeout=timeout,
+                backend=island_backend(world.config, island, world.transport))
             if rank in island.ranks:
                 island_group = created
         bridge: BridgeTransport | None = None
         if layout.needs_bridge:
-            assert world.transport is not None
             bridge = world.transport.create(layout.bridge_ranks, timeout=timeout)
         assert island_group is not None
         topology = Topology(
             rank=rank, layout=layout, peers=world.peers, config=world.config,
             island_group=island_group, bridge=bridge, policy=policy_cls(),
-            transport=world.transport, timeout=timeout, world_group=group)
+            transport=world.transport, timeout=timeout, world_group=group,
+            scope=f"{world.scope}.{name}")
         topology.policy.setup(topology)
     return topology, cpu
 
