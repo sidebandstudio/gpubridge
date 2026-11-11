@@ -1,6 +1,11 @@
-"""``bridge="multitcp"``: the island leaders' bridge over several TCP connections per pair.
+"""``bridge="tcp"``: the island leaders' bridge over several TCP connections per pair.
 
-Opt-in (docs/RUST_TRANSPORT.md). The Rust library in :mod:`gpubridge.multitcp`
+What ``bridge="auto"``, the default, runs on wherever the leaders don't all have a
+usable RDMA device (docs/RUST_TRANSPORT.md); ``bridge="multitcp"`` is its older
+name, and its settings keep theirs (``GPUBRIDGE_MULTITCP_*``). It creates no process
+group, and its native threads never touch a Python object, so a job on it has no
+Gloo thread (docs/RUNTIME_INVENTORY.md, section 6). The Rust library in
+:mod:`gpubridge.multitcp`
 moves tagged byte ranges between leaders over ``GPUBRIDGE_MULTITCP_STREAMS``
 connections per pair (4 by default), each with its own sending and receiving
 thread; this module runs the collectives and the reductions, with torch ops,
@@ -35,6 +40,8 @@ import sys
 import time
 from datetime import timedelta
 from typing import ClassVar
+
+import torch.distributed as dist
 
 from gpubridge import multitcp
 from gpubridge.config import parse_size
@@ -105,15 +112,25 @@ def local_address() -> str:
 
 
 @register_transport
-class MultiTcpTransport(TaggedBridge):
+class TcpTransport(TaggedBridge):
     """The bridge between island leaders over several TCP connections per pair."""
 
-    name = "multitcp"
+    name = "tcp"
     _links: ClassVar[itertools.count] = itertools.count()
+    _instead = ("check that the leaders reach each other on the addresses they publish "
+                f"({IFNAME_ENV}) and that the Rust library is built (python -m "
+                "gpubridge.multitcp build, or GPUBRIDGE_MULTITCP_LIB)")
+
+    def __init__(self, worker, members, rank: int, timeout: timedelta, chunk_bytes: int, *,
+                 streams: int = DEFAULT_STREAMS, address: str = "") -> None:
+        super().__init__(worker, members, rank, timeout, chunk_bytes)
+        self.streams, self.address = streams, address
+        #: How ``init()`` came to this bridge (:attr:`gpubridge.Topology.selection`).
+        self.selection: dict | None = None
 
     @classmethod
     def _connect(cls, store, key: str, members: list[int], rank: int, timeout: timedelta,
-                 deadline: float) -> MultiTcpTransport:
+                 deadline: float) -> TcpTransport:
         chunk, streams = chunk_bytes_setting(), streams_setting()
         index = members.index(rank)
         worker = multitcp.Worker(len(members), index, streams, local_address())
@@ -131,17 +148,41 @@ class MultiTcpTransport(TaggedBridge):
                 theirs, address = entry.rsplit("|", 1)
                 if theirs != settings:
                     raise RuntimeError(
-                        f"multitcp protocol|{CHUNK_BYTES_ENV}|{STREAMS_ENV} is {settings} here "
+                        f"tcp bridge protocol|{CHUNK_BYTES_ENV}|{STREAMS_ENV} is {settings} here "
                         f"but {theirs} on rank {member}; use the same gpubridge and settings "
                         "on every leader")
                 worker.connect(members.index(member), address,
                                max(0.0, deadline - time.monotonic()))
-            transport = cls(worker, members, rank, timeout, chunk)
+            transport = cls(worker, members, rank, timeout, chunk, streams=streams,
+                            address=worker.address())
             transport._handshake(deadline)
             return transport
         except BaseException:
             worker.close(timeout=1.0)
             raise
 
+    def telemetry(self) -> dict:
+        """This leader's end of the bridge, for logs and telemetry correlation: the
+        bridge and its wire protocol, the address it listens on, connections per pair,
+        chunk size, members (global ranks), the first failure if any, and how ``init()``
+        chose it (``selection``)."""
+        return {"bridge": self.name, "provider": "tcp", "protocol": multitcp.protocol(),
+                "address": self.address, "streams": self.streams,
+                "chunk_bytes": self.chunk_bytes, "members": list(self.members),
+                "failed": self.worker.failed,
+                "state": "closed" if self.worker._handle is None else
+                         "failed" if self.worker.failed is not None else "ok",
+                "selection": self.selection}
+
     def close(self) -> None:
         self.worker.close(timeout=min(10.0, self.timeout))
+
+    @classmethod
+    def create_p2p(cls, group, *, store=None, timeout=None):
+        from gpubridge.multitcp.p2p import TcpLink
+
+        return TcpLink(dist.get_rank(), store, timeout or DEFAULT_TIMEOUT)
+
+
+#: The transport's older name: ``bridge="multitcp"`` resolves to it too.
+MultiTcpTransport = TcpTransport

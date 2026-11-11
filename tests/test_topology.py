@@ -105,9 +105,13 @@ def _check_topology(topology, vendors):
     assert topology.is_leader == (topology.rank in expected.bridge_ranks)
     assert dist.get_process_group_ranks(topology.island_group) == list(topology.island.ranks)
     if expected.needs_bridge and topology.is_leader:
-        assert dist.get_process_group_ranks(topology.bridge_group) == list(expected.bridge_ranks)
+        if topology.bridge_group is not None:  # bridge="gloo": a process group
+            members = dist.get_process_group_ranks(topology.bridge_group)
+        else:  # the Rust bridges hold their members themselves
+            members = topology.bridge.members
+        assert members == list(expected.bridge_ranks)
     else:
-        assert topology.bridge_group is None
+        assert topology.bridge is None and topology.bridge_group is None
 
     # Every rank must have elected the same leaders.
     layouts = [None] * topology.world_size

@@ -1,4 +1,5 @@
-"""The multi-stream TCP bridge transport, ``bridge="multitcp"`` (docs/RUST_TRANSPORT.md).
+"""The multi-stream TCP bridge transport, ``bridge="tcp"`` (docs/RUST_TRANSPORT.md), under
+its older name ``"multitcp"``, which the jobs here ask for: both name one transport.
 
 On CPU, between processes on one machine, over loopback TCP: the same code that
 runs between two hosts. Every bridge policy runs on it and must match
@@ -100,6 +101,8 @@ def test_the_listening_address_follows_the_interface_settings(monkeypatch):
 
 def test_multitcp_is_a_known_bridge():
     assert gpubridge.resolve_transport("multitcp") is MultiTcpTransport
+    assert gpubridge.resolve_transport("tcp") is MultiTcpTransport
+    assert MultiTcpTransport.name == "tcp"
 
 
 def test_without_cargo_or_a_library_the_bridge_says_why(monkeypatch, tmp_path):
@@ -310,7 +313,8 @@ def test_a_bad_setting_on_one_leader_fails_init_on_every_rank(tmp_path):
         [{"env": {**good, CHUNK_BYTES_ENV: "12"}, "init_kwargs": {"bridge": "multitcp"}},
          {"env": {**good, VENDOR_ENV: "amd"}, "init_kwargs": {"bridge": "multitcp"}}],
         tmp_path,
-        [r"The multitcp bridge between ranks \[0, 1\] could not be set up", r'bridge="gloo"',
+        [r"The tcp bridge between ranks \[0, 1\] could not be set up",
+         r"python -m gpubridge.multitcp build",
          rf"rank 0: ValueError: {CHUNK_BYTES_ENV}='12' must be"],
     )
 
@@ -338,7 +342,7 @@ def _check_deadline(topology):
         assert time.monotonic() - start < 10
         with pytest.raises(multitcp.TransportError, match="already failed"):
             bridge.all_reduce(tensor)
-    dist.barrier()  # on the world Gloo group, not the bridge
+    dist.barrier()  # through the c10d store, not the bridge
 
 
 @needs_library

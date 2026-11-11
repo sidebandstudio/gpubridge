@@ -253,6 +253,58 @@ def _closed():
     raise TransportError("the verbs bridge is closed")
 
 
+#: Where Linux lists RDMA devices.
+SYSFS_DEVICES = Path("/sys/class/infiniband")
+
+
+def rdma_devices() -> list[str]:
+    """The RDMA devices this machine has (``/sys/class/infiniband``); empty off Linux."""
+    try:
+        return sorted(entry.name for entry in SYSFS_DEVICES.iterdir())
+    except OSError:
+        return []
+
+
+def availability() -> dict:
+    """Whether ``bridge="verbs"`` could run in this process, by the bridge's own check:
+    what ``bridge="auto"`` asks every island leader (:func:`gpubridge.transport.choose_bridge`).
+
+    The check is the one setting up the bridge makes: load (or build) the library, then
+    open an endpoint with this process's ``GPUBRIDGE_VERBS_*`` settings, which selects
+    the device, an active port and its address, or fails with the reason. The endpoint
+    is closed again. Nothing is built or opened on a machine with no RDMA device, and
+    the MOCK test fabric never counts: it is not an RDMA device.
+
+    Returns:
+        ``{"ok": bool, "reason": str, "devices": [...]}``, with ``device``, ``port`` and
+        ``link_layer`` of the endpoint's choice when ``ok``.
+    """
+    if test_fabric_dir() is not None:
+        return {"ok": False, "devices": [],
+                "reason": f"{TEST_FABRIC_ENV} is set: the MOCK test fabric is not an RDMA device"}
+    devices = rdma_devices()
+    if not devices:
+        return {"ok": False, "devices": [],
+                "reason": f"no RDMA device ({SYSFS_DEVICES} is empty or missing)"}
+    try:
+        from gpubridge.verbs.transport import endpoint_settings
+
+        endpoint = Endpoint(2, 0, endpoint_settings())
+    except (Unavailable, TransportError, ValueError, ImportError) as exc:
+        return {"ok": False, "devices": devices,
+                "reason": (str(exc).strip().splitlines() or [type(exc).__name__])[0][:300]}
+    try:
+        told = endpoint.telemetry()
+    except TransportError as exc:
+        return {"ok": False, "devices": devices, "reason": str(exc)[:300]}
+    finally:
+        endpoint.close(timeout=5.0)
+    if told.get("mock"):
+        return {"ok": False, "devices": devices, "reason": "the library is a MOCK provider"}
+    return {"ok": True, "reason": "", "devices": devices, "device": told.get("device"),
+            "port": told.get("port"), "link_layer": told.get("link_layer")}
+
+
 class Endpoint:
     """One bridge member's end: an RC queue pair to every other member, made by
     :meth:`__init__` and connected by :meth:`connect`. Thread-safe in the library; a

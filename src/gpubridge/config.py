@@ -42,10 +42,14 @@ PINNED_STAGING_ENV = "GPUBRIDGE_PINNED_STAGING"
 BRIDGE_COMPRESSION_ENV = "GPUBRIDGE_BRIDGE_COMPRESSION"
 BRIDGE_COMPRESSION_MODES = ("bf16", "fp8")
 
-#: Under the torch.distributed backend (``init_process_group(backend="gpubridge")``)
-#: only: the collective policy and the bridge transport, which ``gpubridge.init()``
-#: takes as arguments. Default ``auto`` and ``gloo``; must match on every rank.
+#: The collective policy under the torch.distributed backend
+#: (``init_process_group(backend="gpubridge")``), which ``gpubridge.init()`` takes as an
+#: argument. Default ``auto``; must match on every rank.
 POLICY_ENV = "GPUBRIDGE_POLICY"
+#: The bridge transport: under the torch.distributed backend, and for
+#: ``gpubridge.init()`` when it isn't passed ``bridge=``. Default ``auto`` (``verbs``
+#: where every island leader has a usable RDMA device, else ``tcp``); ``gloo`` asks for
+#: the Gloo bridge, and with it Gloo groups. Must match on every rank.
 BRIDGE_ENV = "GPUBRIDGE_BRIDGE"
 
 #: torch's CPU backend: ``bridge="gloo"``'s groups, the ``flat-gloo`` policy's, and

@@ -24,7 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import Any
 
@@ -65,17 +65,20 @@ def default_store() -> Any:
 
 
 def wait_for(store, keys: list[str], deadline: float, what: str,
-             failures: Sequence[str] = ()) -> list[str]:
+             failures: Sequence[str] = (), stop: Callable[[], bool] | None = None) -> list[str]:
     """The values of ``keys`` once all exist. Gives up at ``deadline``
-    (``time.monotonic()``), or as soon as one of ``failures`` (a member's status key)
-    holds an error.
+    (``time.monotonic()``), as soon as one of ``failures`` (a member's status key)
+    holds an error, or once ``stop()`` is true (what the wait was for was closed: a
+    thread must not keep asking the store while its job is being torn down).
 
     Raises:
         TimeoutError: naming ``what`` and the keys still missing.
-        RuntimeError: with the first failure found.
+        RuntimeError: with the first failure found, or because ``stop()`` said so.
     """
     pause = WAIT_POLL_FIRST
     while True:
+        if stop is not None and stop():
+            raise RuntimeError(f"stopped waiting for {what}: it was closed")
         if store.check(keys):
             return [store.get(k).decode() for k in keys]
         for failure in failures:

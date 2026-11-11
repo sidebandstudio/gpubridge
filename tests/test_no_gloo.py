@@ -292,7 +292,7 @@ def test_ranks_that_ask_for_different_bridges_fail_init_before_any_group_exists(
         [{"env": {VENDOR_ENV: "nvidia", **LOCAL}, "init_kwargs": {"bridge": "gloo"}},
          {"env": {VENDOR_ENV: "amd", **LOCAL}, "init_kwargs": {"bridge": "multitcp"}}],
         tmp_path, [r"Ranks picked different bridge transports: 'gloo' on ranks \[0\]; "
-                   r"'multitcp' on ranks \[1\]"])
+                   r"'tcp' on ranks \[1\]"])
 
 
 # ---- the solo group ---------------------------------------------------------------------

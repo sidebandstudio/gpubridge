@@ -1,4 +1,4 @@
-"""The bridge transport is swappable, and Gloo stays the default."""
+"""The bridge transport is swappable; the default is ``auto``, and Gloo is opt-in."""
 
 import json
 import subprocess
@@ -10,25 +10,34 @@ from _harness import expected_sum, rank_tensor, run_failing_init, run_ranks
 from _transports import STORE_ENV, StoreTransport
 
 import gpubridge
-from gpubridge.config import VENDOR_ENV
+from gpubridge.config import BRIDGE_ENV, VENDOR_ENV
 from gpubridge.transport import (
     DEFAULT_TRANSPORT,
     BridgeTransport,
     GlooTransport,
     register_transport,
     resolve_transport,
+    transport_name,
 )
 
 
-def test_gloo_is_the_default():
-    assert DEFAULT_TRANSPORT == "gloo"
+def test_auto_is_the_default_and_gloo_is_still_a_name():
+    assert DEFAULT_TRANSPORT == "auto"
+    assert resolve_transport("auto") == "auto" and transport_name("auto") == "auto"
     assert resolve_transport("gloo") is GlooTransport
+    assert transport_name(GlooTransport) == "gloo"
+
+
+def test_multitcp_is_another_name_of_the_tcp_bridge():
+    tcp = resolve_transport("tcp")
+    assert tcp.name == "tcp" and resolve_transport("multitcp") is tcp
+    assert tcp.__module__ == "gpubridge.multitcp.transport"
 
 
 def test_resolve_accepts_names_and_classes():
     assert resolve_transport("test-store") is StoreTransport
     assert resolve_transport(StoreTransport) is StoreTransport
-    with pytest.raises(ValueError, match="known: gloo"):
+    with pytest.raises(ValueError, match="known: auto, gloo"):
         resolve_transport("carrier-pigeon")
     with pytest.raises(TypeError):
         resolve_transport(42)
@@ -60,12 +69,12 @@ print(json.dumps([before, module, loaded(), sorted(gpubridge.transport._TRANSPOR
     assert module == "gpubridge.verbs.transport"
     assert "gpubridge.verbs.transport" in after
     assert not [m for m in after if m.startswith("gpubridge.multitcp")]
-    # verbs still imports helpers from the UCX bridge's module, which registers "ucx".
-    assert "multitcp" not in registered and {"gloo", "verbs"} <= set(registered)
+    assert "tcp" not in registered and {"gloo", "verbs"} <= set(registered)
 
 
-@pytest.mark.parametrize("name", ["ucx", "multitcp", "verbs"])
-def test_a_built_in_name_stays_the_built_ins_before_it_loads(name):
+@pytest.mark.parametrize(("name", "package"), [("ucx", "ucx"), ("tcp", "multitcp"),
+                                               ("verbs", "verbs")])
+def test_a_built_in_name_stays_the_built_ins_before_it_loads(name, package):
     refused, owner = _fresh(f"""
 import json
 from gpubridge.transport import BridgeTransport, register_transport, resolve_transport
@@ -79,11 +88,22 @@ except ValueError as exc:
 print(json.dumps([refused, resolve_transport({name!r}).__module__]))
 """)
     assert "already registered" in refused
-    assert owner == f"gpubridge.{name}.transport"
+    assert owner == f"gpubridge.{package}.transport"
+
+
+@pytest.mark.parametrize(("name", "why"), [("auto", "reserved for automatic selection"),
+                                           ("multitcp", "another name of the built-in 'tcp'")])
+def test_auto_and_an_older_name_cannot_be_registered(name, why):
+    class Mine(StoreTransport):
+        pass
+
+    Mine.name = name
+    with pytest.raises(ValueError, match=why):
+        register_transport(Mine)
 
 
 def test_unknown_names_list_the_built_ins_and_a_broken_one_is_a_value_error(monkeypatch):
-    with pytest.raises(ValueError, match="known: gloo, multitcp, .*ucx, verbs"):
+    with pytest.raises(ValueError, match="known: auto, gloo, tcp, .*ucx, verbs"):
         resolve_transport("carrier-pigeon")
     monkeypatch.setitem(gpubridge.transport._BUILT_IN, "broken", "gpubridge._no_such_module")
     with pytest.raises(ValueError, match="bridge transport 'broken' can't be loaded"):
@@ -102,7 +122,7 @@ def test_register_rejects_non_transports_and_name_clashes():
     assert register_transport(StoreTransport) is StoreTransport  # re-registering is fine
 
 
-def _check_default_bridge(topology):
+def _check_gloo_bridge(topology):
     if topology.layout.needs_bridge and topology.is_leader:
         assert isinstance(topology.bridge, GlooTransport)
         assert topology.bridge_group is topology.bridge.group
@@ -110,12 +130,21 @@ def _check_default_bridge(topology):
         assert topology.bridge is None
         assert topology.bridge_group is None
     assert all(peer.bridge == "gloo" for peer in topology.peers)
+    assert topology.bridge_name == "gloo" and not topology.gloo_free
+    assert topology.selection == {"requested": "gloo", "chosen": "gloo",
+                                  "reason": "asked for by name"}
+    assert torch.distributed.get_backend() == "gloo"  # the default group, as through 0.4.0-alpha
 
 
 @pytest.mark.parametrize("vendors", [["nvidia", "amd", "nvidia", "amd"], ["amd", "amd"]],
                          ids=["mixed", "single-vendor"])
-def test_default_bridge_is_gloo(vendors, tmp_path):
-    run_ranks(vendors, _check_default_bridge, tmp_path)
+@pytest.mark.parametrize("how", ["argument", "environment"])
+def test_the_gloo_bridge_when_it_is_asked_for(vendors, how, tmp_path, monkeypatch):
+    # By name, or for a script that passes none, by GPUBRIDGE_BRIDGE. (The default
+    # bridge is tests/test_bridge_selection.py's.)
+    monkeypatch.setenv(BRIDGE_ENV, "gloo" if how == "environment" else "test-store")
+    run_ranks(vendors, _check_gloo_bridge, tmp_path,
+              init_kwargs={"bridge": "gloo"} if how == "argument" else {})
 
 
 def _check_store_bridge(topology):

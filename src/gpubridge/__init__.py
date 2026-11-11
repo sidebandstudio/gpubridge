@@ -13,6 +13,7 @@ DistributedDataParallel can sync gradients through gpubridge with
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from typing import Any
 
@@ -30,7 +31,7 @@ from gpubridge.collectives import (
     broadcast,
     reduce_scatter_tensor,
 )
-from gpubridge.config import CPU_BACKEND
+from gpubridge.config import BRIDGE_ENV, CPU_BACKEND
 from gpubridge.ddp import ddp_comm_hook
 from gpubridge.detect import Probe, probe
 from gpubridge.observe import (
@@ -56,12 +57,14 @@ from gpubridge.transport import (
     DEFAULT_TRANSPORT,
     BridgeTransport,
     GlooTransport,
+    asks_for_gloo,
     register_transport,
     resolve_transport,
+    transport_name,
 )
 from gpubridge.work import Work
 
-# bridge="ucx", "multitcp" and "verbs" register themselves when a job first names them
+# bridge="tcp", "verbs" and "ucx" register themselves when a job first runs on them
 # (gpubridge.transport._BUILT_IN): importing gpubridge doesn't load them.
 from gpubridge import torch_backend as _torch_backend  # noqa: E402
 
@@ -114,7 +117,7 @@ def init(
     rank: int | None = None,
     world_size: int | None = None,
     timeout: timedelta | None = None,
-    bridge: str | type[BridgeTransport] = DEFAULT_TRANSPORT,
+    bridge: str | type[BridgeTransport] | None = None,
     policy: str | type[CollectivePolicy] = DEFAULT_POLICY,
 ) -> Topology:
     """Join the cluster and build the island and bridge groups.
@@ -131,7 +134,15 @@ def init(
     (:class:`gpubridge.torch_backend.GpubridgeProcessGroup`: ``torch.distributed``
     calls on it run through gpubridge), and :func:`barrier` counts through the
     store: the job creates no Gloo group. Only ``bridge="gloo"`` makes the default
-    group a Gloo group of every rank, as every job's was before.
+    group a Gloo group of every rank, as every job's was through 0.4.0-alpha.
+
+    The bridge between island leaders is one of gpubridge's Rust bridges unless the
+    job names another: ``"auto"`` resolves, once and the same on every rank, to
+    ``"verbs"`` (RDMA) if every island leader has a usable RDMA device, else to
+    ``"tcp"``. :attr:`Topology.selection` records the choice and its reason, the
+    ``gpubridge`` logger reports it at INFO, and it never changes during the job. A
+    bridge asked for by name is never replaced: ``bridge="verbs"`` where verbs can't
+    run fails ``init()`` on every rank.
 
     Args:
         init_method: Rendezvous URL, e.g. ``env://``, ``tcp://host:port`` or ``file:///path``.
@@ -139,8 +150,10 @@ def init(
         world_size: Total number of ranks. Read from the environment if omitted.
         timeout: Timeout for every group gpubridge creates, and for discovery. None
             keeps PyTorch's default (30 minutes).
-        bridge: Transport between island leaders: a registered name or a
-            :class:`BridgeTransport` subclass. Must be the same on every rank.
+        bridge: Transport between island leaders: ``"auto"``, a registered name
+            (``"tcp"``, ``"verbs"``, ``"ucx"``, ``"gloo"``) or a
+            :class:`BridgeTransport` subclass. Must be the same on every rank. None
+            (the default) reads ``GPUBRIDGE_BRIDGE``, else ``"auto"``.
         policy: How collectives are put together: ``"auto"``, a registered
             name (``"reduce-bridge-broadcast"``, ``"native-only"``,
             ``"flat-gloo"``) or a :class:`CollectivePolicy` subclass. Must be the
@@ -165,11 +178,13 @@ def init(
             "torch.distributed is already initialized; gpubridge.init() creates the "
             "default process group itself"
         )
+    if bridge is None:
+        bridge = os.environ.get(BRIDGE_ENV, "").strip() or DEFAULT_TRANSPORT
     transport = resolve_transport(bridge)
     chosen = resolve_policy(policy)
     # torch.cuda.set_device waits until discovery has checked every rank's
     # device (build_topology): a bad index then fails init() on every rank.
-    local, config = _topology.describe_local(transport.name, chosen)
+    local, config = _topology.describe_local(transport_name(transport), chosen)
 
     # The store torch's own rendezvous would make, first: discovery runs on it before
     # any process group exists, so what every rank reports decides the groups.
@@ -179,7 +194,7 @@ def init(
     _topology.validate_peers(peers, warn=rank == 0)
 
     kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
-    gloo = issubclass(transport, GlooTransport)
+    gloo = asks_for_gloo(transport)
     dist.init_process_group(backend=CPU_BACKEND if gloo else _torch_backend.NAME,
                             store=dist.PrefixStore("default_pg", store), rank=rank,
                             world_size=world_size, **kwargs)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import json
+import logging
 import time
 import warnings
 from collections.abc import Iterator, Sequence
@@ -38,8 +39,20 @@ from gpubridge.config import (
 from gpubridge.detect import Probe, detect_vendor, probe
 from gpubridge.policies import AUTO, CollectivePolicy, choose_policy, policy_name
 from gpubridge.split_test import SplitTestWarning, banner, split_labels
-from gpubridge.transport import BridgeTransport, GlooTransport
+from gpubridge.transport import AUTO as AUTO_BRIDGE
+from gpubridge.transport import (
+    TCP,
+    VERBS,
+    BridgeTransport,
+    GlooTransport,
+    asks_for_gloo,
+    choose_bridge,
+    resolve_transport,
+    transport_name,
+)
 from gpubridge.transport import _scope as _transport_scope
+
+log = logging.getLogger("gpubridge")
 
 
 @dataclass(frozen=True)
@@ -135,7 +148,8 @@ class PeerInfo:
     simulated: bool
     hostname: str
     bridge: str
-    """Name of the bridge transport this rank was asked to use."""
+    """Name of the bridge transport this rank was asked to use: ``auto`` unless the job
+    named one. What the job runs on is :attr:`Topology.bridge_name`."""
     probe: Probe
     """The rank's build, GPUs and backends, from :func:`gpubridge.probe`."""
     problems: tuple[str, ...] = ()
@@ -360,7 +374,13 @@ class Topology:
     policy: CollectivePolicy
     """The collective policy every rank runs (``auto`` already resolved)."""
     transport: type[BridgeTransport] | None = None
-    """The bridge transport class every rank chose, on every rank (leaders or not)."""
+    """The bridge transport class the job runs on, on every rank (leaders or not):
+    what the job named, or what ``bridge="auto"`` resolved to at ``init()``."""
+    selection: dict[str, Any] | None = None
+    """How ``init()`` came to :attr:`transport`, the same on every rank:
+    ``{"requested", "chosen", "reason"}``, and under ``auto`` ``"leaders"``, each island
+    leader's report of whether the verbs bridge could run there
+    (:func:`gpubridge.verbs.availability`). Fixed for the job's life."""
     timeout: timedelta | None = None
     """The timeout ``init()`` gave its groups, for groups a policy creates in ``setup()``."""
     world_group: ProcessGroup | None = None
@@ -403,6 +423,12 @@ class Topology:
     def bridge_group(self) -> ProcessGroup | None:
         """The bridge's process group, if its transport has one (``bridge="gloo"`` does)."""
         return getattr(self.bridge, "group", None)
+
+    @property
+    def bridge_name(self) -> str:
+        """Name of the bridge transport the job runs on (``"tcp"``, ``"verbs"`` ...), on
+        every rank, also where no bridge is created (one island)."""
+        return cast(type[BridgeTransport], self.transport).name
 
     @property
     def gloo_free(self) -> bool:
@@ -553,11 +579,67 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
     return tuple(PeerInfo.from_wire(rec["peer"]) for rec in records)
 
 
+def select_bridge(requested: str | type[BridgeTransport], layout: Layout, rank: int,
+                  scope: str, timeout: timedelta | None
+                  ) -> tuple[type[BridgeTransport], dict[str, Any]]:
+    """The bridge transport the job runs on, and how it was chosen.
+
+    A named bridge is itself. ``"auto"`` is resolved here, once: each island leader
+    publishes whether the verbs bridge could run on its RDMA device
+    (:func:`gpubridge.verbs.availability`) in the c10d store, every rank reads all of
+    the leaders' reports, and :func:`gpubridge.transport.choose_bridge` turns them into
+    ``"verbs"`` or ``"tcp"``: the same on every rank, since every rank reads the same
+    reports. With one island no bridge is created and nothing is probed.
+
+    Collective over every rank, once the default group exists.
+
+    Raises:
+        TimeoutError: if a leader's report doesn't arrive in ``timeout``.
+        ValueError: if the chosen bridge's module can't be imported.
+    """
+    name = transport_name(requested)
+    if requested != AUTO_BRIDGE:
+        assert not isinstance(requested, str)
+        return requested, {"requested": name, "chosen": name, "reason": "asked for by name"}
+    selection: dict[str, Any] = {"requested": AUTO_BRIDGE}
+    if not layout.needs_bridge:
+        chosen, reason = TCP, "one island: no bridge is created, and no device was checked"
+    else:
+        from gpubridge import verbs  # a small module: no library is loaded by importing it
+
+        leaders = layout.bridge_ranks
+        store = _rendezvous.default_store()
+        prefix = f"gpubridge/{scope}/verbs"
+        if rank in leaders:
+            try:
+                report = verbs.availability()
+            except Exception as exc:  # noqa: BLE001 - a probe must never take init() down
+                report = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+            store.set(f"{prefix}/{rank}", json.dumps(report))
+        deadline = time.monotonic() + (timeout or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
+        values = _rendezvous.wait_for(
+            store, [f"{prefix}/{leader}" for leader in leaders], deadline,
+            "every island leader's report on its RDMA device (bridge=\"auto\")")
+        reports = {leader: json.loads(value) for leader, value in zip(leaders, values,
+                                                                      strict=True)}
+        chosen, reason = choose_bridge(leaders, reports)
+        selection["leaders"] = {str(leader): report for leader, report in reports.items()}
+        surprised = [leader for leader in leaders
+                     if reports[leader].get("devices") and not reports[leader].get("ok")]
+        if chosen != VERBS and surprised and rank == leaders[0]:
+            log.warning("gpubridge: bridge=\"auto\" runs on the TCP bridge although island "
+                        "leaders %s have an RDMA device: %s", surprised, reason)
+    selection.update(chosen=chosen, reason=reason)
+    transport = resolve_transport(chosen)
+    assert not isinstance(transport, str)
+    return transport, selection
+
+
 def build_topology(
     peers: Sequence[PeerInfo],
     config: Config,
     *,
-    transport: type[BridgeTransport],
+    transport: str | type[BridgeTransport],
     policy: str | type[CollectivePolicy] = AUTO,
     timeout: timedelta | None = None,
     world_group: ProcessGroup | None = None,
@@ -573,7 +655,8 @@ def build_topology(
         peers: Every rank's :class:`PeerInfo` by global rank, from :func:`discover`,
             which :func:`validate_peers` has accepted.
         config: This rank's resolved configuration.
-        transport: The bridge transport class every rank chose.
+        transport: The bridge every rank asked for: ``"auto"`` (resolved here,
+            :func:`select_bridge`) or a transport class.
         policy: ``"auto"`` or the collective policy class; its name is ``peers``'.
         timeout: Timeout for the new groups' collectives. None keeps PyTorch's default.
         world_group: A Gloo group of every rank the caller made for ``barrier()``,
@@ -609,6 +692,9 @@ def build_topology(
     if clashes:
         raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
     policy_cls = choose_policy(policy, layout)
+    transport, selection = select_bridge(transport, layout, rank, scope, timeout)
+    log.info("gpubridge: rank %d of %d, bridge %r (%s)", rank, len(peers), transport.name,
+             selection["reason"])
 
     # Every rank visits the groups in the same order. Inside setup_names only a
     # group's members create it and synchronize; bridge="gloo" through
@@ -627,6 +713,8 @@ def build_topology(
                 f"{transport.__name__}.create() must return a transport exactly on the "
                 f"bridge ranks {list(layout.bridge_ranks)}; rank {rank} got {bridge!r}"
             )
+        if hasattr(bridge, "selection"):
+            bridge.selection = selection  # for the bridge's telemetry()
     assert island_group is not None
 
     topology = Topology(
@@ -638,6 +726,7 @@ def build_topology(
         bridge=bridge,
         policy=policy_cls(),
         transport=transport,
+        selection=selection,
         timeout=timeout,
         world_group=world_group,
         scope=scope,
@@ -646,7 +735,8 @@ def build_topology(
     return topology
 
 
-def island_backend(config: Config, island: Island, transport: type[BridgeTransport]) -> str:
+def island_backend(config: Config, island: Island,
+                   transport: str | type[BridgeTransport]) -> str:
     """The backend of ``island``'s process group.
 
     NCCL (RCCL on ROCm builds) on GPUs. In CPU simulation and CPU-only mode, a test
@@ -656,7 +746,7 @@ def island_backend(config: Config, island: Island, transport: type[BridgeTranspo
     one-rank islands on a bridge other than Gloo has no Gloo group at all. With
     ``bridge="gloo"`` a one-rank island stays the Gloo group it always was.
     """
-    if config.simulated and len(island.ranks) == 1 and not issubclass(transport, GlooTransport):
+    if config.simulated and len(island.ranks) == 1 and not asks_for_gloo(transport):
         return SOLO_BACKEND
     return config.island_backend
 
@@ -887,12 +977,14 @@ def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
         bridge: BridgeTransport | None = None
         if layout.needs_bridge:
             bridge = world.transport.create(layout.bridge_ranks, timeout=timeout)
+            if hasattr(bridge, "selection"):
+                bridge.selection = world.selection
         assert island_group is not None
         topology = Topology(
             rank=rank, layout=layout, peers=world.peers, config=world.config,
             island_group=island_group, bridge=bridge, policy=policy_cls(),
-            transport=world.transport, timeout=timeout, world_group=group,
-            scope=f"{world.scope}.{name}")
+            transport=world.transport, selection=world.selection, timeout=timeout,
+            world_group=group, scope=f"{world.scope}.{name}")
         topology.policy.setup(topology)
     return topology, cpu
 

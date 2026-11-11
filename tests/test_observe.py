@@ -7,8 +7,7 @@ import warnings
 
 import pytest
 import torch
-import torch.distributed as dist
-from _harness import TIMEOUT, run_ranks
+from _harness import TIMEOUT, gather, run_ranks
 
 import gpubridge
 from gpubridge import observe
@@ -29,12 +28,6 @@ class Keep(gpubridge.CollectiveObserver):
 
     def on_detach(self, error):
         self.detached = error
-
-
-def gather(value):
-    out = [None] * dist.get_world_size()
-    dist.all_gather_object(out, value)
-    return out
 
 
 def run_some_collectives(topology):

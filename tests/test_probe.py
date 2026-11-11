@@ -6,7 +6,7 @@ from functools import partial
 import pytest
 import torch
 import torch.distributed as dist
-from _harness import run_failing_init, run_ranks
+from _harness import default_bridge, run_failing_init, run_ranks
 
 from gpubridge.config import CPU_ONLY_ENV, VENDOR_ENV
 from gpubridge.detect import probe
@@ -85,7 +85,7 @@ def _check_probes_shared(topology, vendors):
     assert len(topology.peers) == len(vendors)
     for peer, vendor in zip(topology.peers, vendors, strict=True):
         assert peer.problems == ()
-        assert peer.bridge == "gloo"
+        assert peer.bridge == default_bridge()  # what each rank asked for
         assert peer.probe.torch_version == torch.__version__
         assert peer.probe.gloo_available
         assert peer.probe.build_vendor == vendor  # each rank's own (faked) build

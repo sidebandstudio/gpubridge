@@ -318,7 +318,10 @@ def _cpu_tensor_path(rank, world):
     assert seen == ["barrier"], seen  # the rest on the backend's Gloo group, not gpubridge
 
 
-def test_the_cpu_tensor_path_carries_every_collective_on_gloo(tmp_path):
+def test_the_cpu_tensor_path_carries_every_collective_on_gloo(tmp_path, monkeypatch):
+    # bridge="gloo": the one bridge whose backend has a Gloo group for CPU tensors. (On
+    # any other they go through the topology: tests/test_no_gloo.py.)
+    monkeypatch.setenv(BRIDGE_ENV, "gloo")
     run_backend(TWO_TWO, _cpu_tensor_path, tmp_path)
 
 
@@ -570,10 +573,44 @@ def _backend_group_after_init(topology):
         dist.all_reduce(torch.ones(2), group=group)
 
 
-def test_a_backend_group_after_gpubridge_init_is_refused(tmp_path):
+def test_a_backend_group_after_gpubridge_init_on_gloo_is_refused(tmp_path):
+    # After init(bridge="gloo") the default group is a Gloo one, and a group of this
+    # backend beside it would be a second gpubridge in the process.
     from _harness import run_ranks
 
-    run_ranks(TWO_TWO, _backend_group_after_init, tmp_path)
+    run_ranks(TWO_TWO, _backend_group_after_init, tmp_path, init_kwargs={"bridge": "gloo"})
+
+
+def _backend_groups_after_init(topology):
+    # On any other bridge the default group is this backend's already: a group of every
+    # rank runs on init()'s topology, and a subgroup builds its own, as under
+    # init_process_group(backend="gpubridge").
+    assert isinstance(dist.distributed_c10d._get_default_group(),
+                      torch_backend.GpubridgeProcessGroup)
+    rank, world = topology.rank, topology.world_size
+    everyone = dist.new_group(list(range(world)), backend="gpubridge")
+    t = rank_tensor((3,), torch.float32, rank)
+    dist.all_reduce(t, group=everyone)
+    assert torch.equal(t, expected_sum((3,), torch.float32, world))
+    assert gpubridge.get_topology() is topology
+    pair = dist.new_group([0, 2])  # one rank of each vendor, on the default backend
+    if rank in (0, 2):
+        t = rank_tensor((3,), torch.float32, rank)
+        dist.all_reduce(t, group=pair)
+        assert torch.equal(t, rank_tensor((3,), torch.float32, 0) + rank_tensor(
+            (3,), torch.float32, 2))
+        assert _sub(pair)._topology().layout.members == (0, 2)
+    dist.barrier()
+    t = rank_tensor((2,), torch.float32, rank)
+    gpubridge.all_reduce(t)
+    assert torch.equal(t, expected_sum((2,), torch.float32, world))
+
+
+def test_backend_groups_after_gpubridge_init_run_on_its_topology(tmp_path, monkeypatch):
+    from _harness import run_ranks
+
+    monkeypatch.delenv(BRIDGE_ENV, raising=False)
+    run_ranks(TWO_TWO, _backend_groups_after_init, tmp_path)
 
 
 def test_bridge_from_gpubridge_bridge_is_checked(tmp_path):
@@ -750,14 +787,16 @@ def _hsdp(rank, world, out):
     records = _Records()
     gpubridge.add_observer(records)
     bridge_calls = []
+    active = gpubridge.get_topology().transport  # the bridge the job runs on
+    assert issubclass(active, transport.BridgeTransport)
     for name in ("all_reduce", "broadcast"):
-        plain = getattr(transport.GlooTransport, name)
+        plain = getattr(active, name)
 
         def counted(self, *args, _plain=plain, _name=name, **kwargs):
             bridge_calls.append(_name)
             return _plain(self, *args, **kwargs)
 
-        setattr(transport.GlooTransport, name, counted)
+        setattr(active, name, counted)
     mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("replicate", "shard"))
     shard, replicate = mesh.get_group("shard"), mesh.get_group("replicate")
     assert _sub(shard)._topology().layout.members == ((0, 1) if rank < 2 else (2, 3))

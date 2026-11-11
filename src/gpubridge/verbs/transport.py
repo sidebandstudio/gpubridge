@@ -233,8 +233,8 @@ class VerbsTransport(TaggedBridge):
     name = "verbs"
     device_tensors = True
     _links: ClassVar[itertools.count] = itertools.count()
-    _instead = ("verbs is never replaced by another transport on its own; choose one "
-                'explicitly (bridge="gloo", say) to run without it')
+    _instead = ("verbs is never replaced by another transport once it is chosen; choose "
+                'one explicitly (bridge="tcp", say) to run without it')
 
     def __init__(self, worker: Router, members, rank: int, timeout: timedelta,
                  chunk_bytes: int, *, emitter: observe.Emitter | None = None,
@@ -244,6 +244,8 @@ class VerbsTransport(TaggedBridge):
         self.gpu_path = gpu_path_setting()
         self.staged_overlap = staged_overlap_setting()
         self.emitter = emitter
+        #: How ``init()`` came to this bridge (:attr:`gpubridge.Topology.selection`).
+        self.selection: dict | None = None
         self.base_record = base_record or {}
         self.peer_nics = peer_nics or {}
         #: The training step to put in observations, if the caller sets it.
@@ -637,7 +639,8 @@ class VerbsTransport(TaggedBridge):
         ``staged``) and ``path_reason``, ``last_gpu`` (with the call's bounced receives
         and, staged, its ``staging``), per-path counts, ``staged_overlap_setting``, the
         staged calls' phase times (``staged_phases``, module docs),
-        each GPU's direct-path support and the observation emitter's counts. Never a remote key."""
+        each GPU's direct-path support, the observation emitter's counts and how ``init()``
+        chose this bridge (``selection``). Never a remote key."""
         router = self.worker
         gpus = {str(i): {"direct": s.ok, "reason": s.reason or None, "driver": s.driver,
                          "flush": s.flush.method if s.flush else None,
@@ -651,7 +654,8 @@ class VerbsTransport(TaggedBridge):
                 "in_place_ops": router.in_place_ops, "plain_ops": router.plain_ops,
                 "bounced_ops": router.bounced_ops,
                 "staged_phases": dict(self.staged_phases),
-                "observations": self.emitter.stats() if self.emitter else None}
+                "observations": self.emitter.stats() if self.emitter else None,
+                "selection": self.selection}
 
     @property
     def state(self) -> str:

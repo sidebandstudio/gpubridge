@@ -291,7 +291,7 @@ def _check_reduce_op(policy: CollectivePolicy, name: str, topology: Topology, fn
     if name not in supported:
         raise NotImplementedError(
             f"gpubridge.{fn} with {name.upper()}: collective policy {policy.name!r} with bridge "
-            f"transport {topology.peers[topology.rank].bridge!r} supports only "
+            f"transport {topology.bridge_name!r} supports only "
             f"{', '.join(sorted(n.upper() for n in supported))}."
         )
 

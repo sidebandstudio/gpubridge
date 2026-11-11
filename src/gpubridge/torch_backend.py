@@ -13,7 +13,8 @@ vendor islands. Design and limits: docs/TORCH_BACKEND.md.
   subgroup (``new_group``, a ``DeviceMesh`` dimension) builds a topology of its
   own over its members at its first collective: ``native-only`` if they are one
   vendor, bridged if they are mixed (docs/TORCH_BACKEND.md, "Subgroups and HSDP"). ``GPUBRIDGE_POLICY`` and ``GPUBRIDGE_BRIDGE`` pick the
-  policy and bridge transport (``auto`` and ``gloo`` by default).
+  policy and bridge transport (both ``auto`` by default: the bridge is then one of
+  the Rust bridges, :func:`gpubridge.transport.choose_bridge`).
 - ``gpubridge.init()`` on a bridge other than Gloo makes a group of this backend
   the job's default group, with its topology already built: ``dist`` calls on
   the default group then run through gpubridge too.
@@ -54,7 +55,12 @@ from gpubridge import work as _work
 from gpubridge import rendezvous as _rendezvous
 from gpubridge.config import BRIDGE_ENV, CPU_BACKEND, POLICY_ENV, SOLO_BACKEND
 from gpubridge.policies import DEFAULT_POLICY, resolve_policy
-from gpubridge.transport import DEFAULT_TRANSPORT, GlooTransport, resolve_transport
+from gpubridge.transport import (
+    DEFAULT_TRANSPORT,
+    asks_for_gloo,
+    resolve_transport,
+    transport_name,
+)
 
 NAME = "gpubridge"
 
@@ -949,7 +955,7 @@ def setup(timeout: timedelta | None) -> dist.ProcessGroup | None:
         transport = resolve_transport(os.environ.get(BRIDGE_ENV, "").strip()
                                       or DEFAULT_TRANSPORT)
         chosen = resolve_policy(os.environ.get(POLICY_ENV, "").strip() or DEFAULT_POLICY)
-        local, config = _topology.describe_local(transport.name, chosen)
+        local, config = _topology.describe_local(transport_name(transport), chosen)
     except (ValueError, TypeError) as exc:
         problem = str(exc)
     peers = _topology.discover(_rendezvous.default_store(), scope, dist.get_rank(),
@@ -966,7 +972,7 @@ def _build(peers: Sequence[_topology.PeerInfo], config, transport, policy,
     islands and the bridge. Sets the topology."""
     world = cpu = None
     with _topology.setup_names(f"gpubridge:{scope}"):
-        if issubclass(transport, GlooTransport):
+        if asks_for_gloo(transport):
             ranks = list(range(len(peers)))
             world = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)
             cpu = dist.new_group(ranks, backend=CPU_BACKEND, timeout=timeout)

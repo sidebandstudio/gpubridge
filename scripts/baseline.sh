@@ -11,7 +11,8 @@
 #
 # A pass is not GPU or RDMA validation: GPU tests skip, the verbs bridge runs on its
 # MOCK test fabric, and the libibverbs build and its tests run only on Linux with
-# rdma-core's headers. Settings:
+# rdma-core's headers. The suite runs twice: on the default bridge, then on the Gloo
+# bridge (GPUBRIDGE_BRIDGE=gloo). Settings:
 #   PYTHON          the interpreter (default: python)
 #   PYTEST_ARGS     what pytest runs (default: the whole suite)
 #   GPUBRIDGE_MULTITCP_LIB_DIR, GPUBRIDGE_VERBS_CACHE_DIR  where built libraries go
@@ -90,6 +91,11 @@ step identity_built "$python" scripts/baseline_identity.py "$out/identity.json"
 # shellcheck disable=SC2086 # PYTEST_ARGS is a list of words on purpose
 step pytest "$python" -m pytest -rs --durations=30 -p no:cacheprovider \
     --junitxml="$out/junit.xml" ${PYTEST_ARGS:-}
+# The suite again with every job that names no bridge on the Gloo bridge (opt-in since
+# the default became bridge="auto"), as CI's second 3.12 leg does.
+# shellcheck disable=SC2086
+step pytest_gloo env GPUBRIDGE_BRIDGE=gloo "$python" -m pytest -rs --durations=30 \
+    -p no:cacheprovider --junitxml="$out/junit-gloo.xml" ${PYTEST_ARGS:-}
 step simulate "$python" examples/simulate_two_islands.py
 
 printf '{"completed": true, "failed": %d}\n' "$failed" >>"$out/steps.jsonl"

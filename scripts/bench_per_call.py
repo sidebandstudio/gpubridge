@@ -163,8 +163,10 @@ def rank_main(rank: int, args: argparse.Namespace, init_file: str, result_file: 
     torch.set_num_threads(1)
     samples: dict[str, list[int]] = {}
     for policy in args.policies:
+        # bridge="gloo": the "same calls" this compares gpubridge with are torch calls
+        # on its groups, the bridge's Gloo group among them.
         topology = gpubridge.init(init_method=f"file://{init_file}-{policy}", rank=rank,
-                                  world_size=len(args.vendors), policy=policy,
+                                  world_size=len(args.vendors), policy=policy, bridge="gloo",
                                   timeout=timedelta(seconds=120))
         real = {name: getattr(dist, name) for name in STUBBED}
         try:

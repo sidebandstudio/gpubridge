@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
+import pickle
 import re
 from collections.abc import Callable, Sequence
 from datetime import timedelta
@@ -58,6 +60,30 @@ def assert_no_gloo() -> None:
     if Path("/proc/self/task").is_dir():
         found = [name for name in thread_names() if name in GLOO_THREADS]
         assert found == [], f"Gloo threads in a job that didn't ask for Gloo: {found}"
+
+
+_gathers = itertools.count()
+
+
+def gather(value: Any) -> list[Any]:
+    """Every rank's ``value``, by rank: the tests' own exchange between ranks.
+
+    Through the job's c10d store, not a collective. On a job without Gloo the default
+    process group is gpubridge's own, so ``dist.all_gather_object`` there is itself a
+    gpubridge collective: observers would record the test's bookkeeping among the
+    collectives under test, and it would take a sequence number. Collective all the
+    same: every rank calls it at the same point."""
+    store = dist.distributed_c10d._get_default_store()
+    number, rank = next(_gathers), dist.get_rank()
+    store.set(f"gpubridge-test/gather/{number}/{rank}", pickle.dumps(value))
+    return [pickle.loads(store.get(f"gpubridge-test/gather/{number}/{r}"))
+            for r in range(dist.get_world_size())]
+
+
+def default_bridge() -> str:
+    """The bridge a job that names none asks for: ``GPUBRIDGE_BRIDGE`` if the suite runs
+    with one (``gloo``, to run every test on the Gloo bridge), else ``auto``."""
+    return os.environ.get("GPUBRIDGE_BRIDGE", "").strip() or "auto"
 
 
 def run_ranks(

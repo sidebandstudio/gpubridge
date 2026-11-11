@@ -21,6 +21,10 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 KIT = REPO / "scripts" / "gpu"
+#: The bridge a kit run that names none runs on here: what bridge="auto" resolves to on
+#: a machine without a usable RDMA device. (clean_env keeps every GPUBRIDGE_* setting
+#: of the developer's out of the kit's runs, a GPUBRIDGE_BRIDGE=gloo for the suite too.)
+RAN_ON = "tcp"
 sys.path.insert(0, str(KIT))
 
 import bench_all_reduce  # noqa: E402
@@ -2238,8 +2242,9 @@ def test_bench_p2p_times_each_route_and_checks_the_payload(ranks, routes, tmp_pa
         (route, n) for route in routes for n in (1024, 4096)}
     assert all(r["payload_ok"] and r["trials"] == 2 and r["bandwidth_GBps"] > 0
                for r in record["rows"])
+    # The transport the job ran on: without RDMA here, the default is the TCP bridge.
     assert record["staging"] == {"pinned_staging": False, "p2p_chunk_bytes": 0,
-                                 "transport": "gloo"}
+                                 "transport": RAN_ON}
     assert "| bridge |" in (out / "summary.md").read_text()
 
 
