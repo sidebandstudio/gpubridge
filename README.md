@@ -16,8 +16,9 @@ and by the opt-in verbs bridge on real libibverbs through one InfiniBand HCA in
 loopback, staged through host memory. Not yet: verbs between machines, AMD or
 mixed-vendor verbs, GPU memory direct to the NIC (GPUDirect), or more than four
 GPUs. **Since 2026-11-11 a job creates no Gloo process group unless it asks for
-one, and the default bridge is one of the Rust bridges (`bridge="auto"`): that
-change is tested on CPU only and has not run on a GPU**
+one (or accepts torch's own at its debug level DETAIL, which is otherwise
+refused), and the default bridge is one of the Rust bridges (`bridge="auto"`):
+that change is tested on CPU only and has not run on a GPU**
 ([what changed](#the-default-bridge-and-gloo)). The [CHANGELOG](CHANGELOG.md) lists every GPU run,
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
 what each one showed, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) what the
@@ -141,6 +142,22 @@ links at once), never what a collective computes, and `auto` never picks them.
    island goes unchecked instead. The ranks create the groups in the same
    order, each group by its own members, and the bridge transport is created
    the same way.
+
+**torch's debug level DETAIL.** With `TORCH_DISTRIBUTED_DEBUG=DETAIL` (or
+`torch.distributed.set_debug_level`) torch wraps every NCCL, RCCL or Gloo group
+it creates in a checker that runs on a Gloo helper group of the same ranks. A
+job that didn't ask for Gloo would get Gloo groups and their worker threads
+back that way, with the exit abort they can cause on Python 3.12. So `init()`
+refuses such a job on every rank, with one message, before any island group
+exists. Either lower the debug level (`INFO` keeps torch's other debug output),
+or accept the helper groups and that exposure for the job:
+`gpubridge.init(allow_debug_gloo=True)`, or `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`
+(which also serves `init_process_group(backend="gpubridge")`), the same on
+every rank. gpubridge never changes the debug level. A level raised after
+`init()` is not seen, except when a subgroup is set up later; a job on
+`bridge="gloo"` is not checked. Tested on CPU, where simulation's Gloo islands
+stand in for NCCL ones; that torch treats an NCCL group the same way is read
+from its source (2.8.0 and 2.15.0), not shown on a GPU.
 
 A script that returns without calling `destroy()` is covered: an exit handler
 closes the bridge, which joins its native threads, before the interpreter
@@ -274,7 +291,7 @@ The API follows `torch.distributed`, always on the world group.
 
 | Function | Description |
 | --- | --- |
-| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge=None, policy="auto") -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the [bridge transport](#bridge-transports) (`"auto"`, a registered name such as `"tcp"`, `"verbs"` or `"gloo"`, or a `BridgeTransport` subclass; `None` reads `GPUBRIDGE_BRIDGE`, else `"auto"`) and the [collective policy](#collective-policies) (`"auto"`, a registered name, or a `CollectivePolicy` subclass). Both must be the same on every rank. |
+| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge=None, policy="auto", allow_debug_gloo=None) -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the [bridge transport](#bridge-transports) (`"auto"`, a registered name such as `"tcp"`, `"verbs"` or `"gloo"`, or a `BridgeTransport` subclass; `None` reads `GPUBRIDGE_BRIDGE`, else `"auto"`) and the [collective policy](#collective-policies) (`"auto"`, a registered name, or a `CollectivePolicy` subclass). Both must be the same on every rank. `allow_debug_gloo` (`None` reads `GPUBRIDGE_ALLOW_DEBUG_GLOO`) accepts torch's Gloo helper groups at its debug level DETAIL, which is [refused otherwise](#initialization). |
 | `all_reduce(tensor, op=ReduceOp.SUM, *, async_op=False)` | In-place reduction across all ranks: `SUM`, `AVG`, `MAX` or `MIN`. `AVG` is a SUM divided by the world size, identically on every rank, so it needs a floating-point dtype. |
 | `broadcast(tensor, src, *, async_op=False)` | In-place copy from global rank `src` to all ranks. |
 | `all_gather_into_tensor(output, input, *, async_op=False)` | Every rank's `input`, back to back in global rank order, in `output` (`world_size` times as many elements). |
@@ -310,7 +327,8 @@ logical OR on both backends.
 the job runs on and `selection` how `init()` came to it (what was asked for,
 what was chosen and why, and under `auto` each leader's device report).
 `bridge_group` is the bridge's process group when the transport has one, as
-`bridge="gloo"` does; `gloo_free` says the job didn't ask for Gloo.
+`bridge="gloo"` does; `gloo_free` says the job didn't ask for Gloo, `debug_gloo` that it
+accepted torch's Gloo helper groups at debug level DETAIL all the same.
 
 ### Collective policies
 
@@ -644,8 +662,10 @@ rank, to one of gpubridge's two Rust bridges:
   on Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can abort a
   process at interpreter exit, after training has finished
   ([docs/RUNTIME_INVENTORY.md](docs/RUNTIME_INVENTORY.md#6-the-gloo-decisions-reversed-2026-11-11)).
-  A job on the Rust bridges has no Gloo group and no Gloo thread; their own
-  threads never touch a Python object.
+  A job on the Rust bridges has no Gloo group and no Gloo thread, unless it
+  accepts torch's debug helpers (`allow_debug_gloo`,
+  [above](#initialization)); the bridges' own threads never touch a Python
+  object.
 - **Same results.** The Rust bridges reproduce the Gloo bridge's results bit for
   bit: with two bridge members (every NVIDIA + AMD job) on any data, and with
   more on integers, MAX, MIN, broadcasts and exact sums

@@ -729,8 +729,16 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     (`cat /proc/<pid>/task/*/comm` on each rank after its first collectives). A
     rank with no GPU, a `LOCAL_RANK` with no GPU behind it and ranks that ask
     for different bridges must still fail `init()` on every rank with one
-    message. *Status: tested on CPU (`tests/test_no_gloo.py`, and every
-    existing suite on the default). NCCL island groups under gpubridge's own
+    message. And at torch's debug level DETAIL: with
+    `TORCH_DISTRIBUTED_DEBUG=DETAIL` the job must be refused on every rank
+    before any NCCL group exists; with `GPUBRIDGE_ALLOW_DEBUG_GLOO=1` added it
+    must start, `topology.debug_gloo` be true and the Gloo threads be there
+    (torch's helper groups around the NCCL islands); without DETAIL, none.
+    *Status: tested on CPU (`tests/test_no_gloo.py`, and every
+    existing suite on the default; the DETAIL guard in
+    `tests/test_debug_gloo.py`, where simulation's Gloo islands stand in for
+    NCCL ones: that torch wraps an NCCL group the same way is read from its
+    source, 2.8.0 and 2.15.0). NCCL island groups under gpubridge's own
     default group are what `backend="gpubridge"` has always created, and that
     ran on GPUs at `c92684b` (torch 2.14.1, two 2-GPU V100 islands, with the
     Gloo bridge and the Gloo groups of every rank beside them). Not run on a

@@ -17,7 +17,9 @@ abort a process at interpreter exit, after training has finished
 ([RUNTIME_INVENTORY.md](RUNTIME_INVENTORY.md#6-the-gloo-decisions-reversed-2026-11-11)).
 A job on this bridge creates no Gloo group: the bridge is not a process group,
 its rendezvous is the c10d store, and its threads never touch a Python object
-(["Threading"](#design)). What it had to show to take Gloo's place is the same
+(["Threading"](#design)). (torch would add Gloo helper groups to the islands at
+its debug level DETAIL; `init()` refuses that unless the job opts in:
+RUNTIME_INVENTORY.md, section 6.) What it had to show to take Gloo's place is the same
 results and no worse speed, not the 20% the first gate asked:
 
 - the same bits as the Gloo bridge: `tests/test_parity_fixture.py` (SHA-256 hashes

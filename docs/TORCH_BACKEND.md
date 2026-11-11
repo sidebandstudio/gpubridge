@@ -129,7 +129,9 @@ rank is part of it unless the bridge is Gloo: discovery and `barrier()` go
 through the job's c10d store, and where this section says "Gloo groups" below it
 describes `GPUBRIDGE_BRIDGE=gloo`. docs/RUNTIME_INVENTORY.md, section 6, has the
 whole change. `gpubridge.init()` on any other bridge now creates its default
-group on this backend and builds the topology at once.) gpubridge needs its own
+group on this backend and builds the topology at once. At torch's debug level
+DETAIL the setup is refused on every rank unless `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`:
+torch would wrap each island group around a Gloo helper group.) gpubridge needs its own
 groups: one per island on its native backend, and the bridge; with
 `bridge="gloo"` also a Gloo group
 of every rank (`barrier()`, `flat-gloo`). `dist.new_group` can't run inside

@@ -187,12 +187,40 @@ that doesn't ask for it, and a Rust bridge is the default.
   deployment. Such a group carries the exit abort above for as long as the rank holds
   its topology (README, "Simulation mode"): one test's rank did, and aborted in 11 of
   380 runs until it let go before returning (0 of 300).
-- torch's own debug wrapper: with `TORCH_DISTRIBUTED_DEBUG=DETAIL` torch wraps every
-  process group it creates, NCCL ones included, in a checker that uses a Gloo group.
-  That is torch's doing, not gpubridge's.
+- torch's own debug wrapper, and only if the job accepts it. At torch's distributed
+  debug level DETAIL (`TORCH_DISTRIBUTED_DEBUG=DETAIL`, or
+  `torch.distributed.set_debug_level`) torch's `new_group` wraps every group of a C++
+  backend, NCCL and RCCL ones included, in a checker (`_ProcessGroupWrapper`) that runs
+  on a `ProcessGroupGloo` helper of the same ranks. A GPU job would have Gloo groups and
+  threads without naming Gloo. So `init()` refuses a job that didn't ask for Gloo at
+  that level: every rank reports its level in discovery, and every rank raises the same
+  error, before any island group exists, saying what DETAIL does and the two ways on.
+  One is to lower the level. The other is the explicit opt-in `allow_debug_gloo=True`
+  (`GPUBRIDGE_ALLOW_DEBUG_GLOO=1` for either init API; the same on every rank, or
+  `init()` fails naming the ranks): the job then starts with the helper groups, their
+  `pt_gloo_runloop` threads and the exit-abort exposure above, and
+  `Topology.debug_gloo` says so. gpubridge never changes the level itself. A job
+  whose island groups are all Python groups (one-rank simulated islands) is not
+  refused: torch wraps none of them.
 
-A GPU job on `auto`, `tcp`, `verbs` or `ucx` therefore creates no Gloo group and has no
-thread named `pt_gloo_runloop` or `gloo_tcp_loop`.
+So: a GPU job on `auto`, `tcp`, `verbs` or `ucx` that starts without `allow_debug_gloo`
+has no Gloo group and no thread named `pt_gloo_runloop` or `gloo_tcp_loop` when
+`init()` returns. Two limits of that sentence:
+
+- **A debug level raised after `init()` is outside the guard.** The islands exist by
+  then and are not wrapped. A subgroup set up later (HSDP, a DeviceMesh dimension)
+  checks the level again on each of its members and is refused there, but only where
+  the level was raised: members that didn't raise it wait for the others until their
+  timeout. Anything else the program then creates with torch's own `new_group` on a
+  C++ backend is torch's, wrapped, and not seen by gpubridge.
+- **What is established, and how.** That torch wraps a C++ group at DETAIL and not a
+  Python one is tested on CPU with simulation's Gloo islands standing in for NCCL ones
+  (`tests/test_debug_gloo.py`, torch 2.8.0 and 2.15.0); that the rule refuses a layout
+  of native islands is tested as a function of the ranks' reports. That torch wraps an
+  NCCL group the same way rests on reading `_new_process_group_helper` in those two
+  releases (NCCL and Gloo take the same branch). No GPU run has shown the refusal, the
+  helper under NCCL, or its absence without DETAIL
+  (HARDWARE_VALIDATION.md item 44).
 
 **The checks the 2026-10-20 row asked a replacement to pass**, and what covers each,
 all on CPU:

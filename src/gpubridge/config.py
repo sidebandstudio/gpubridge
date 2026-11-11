@@ -52,6 +52,14 @@ POLICY_ENV = "GPUBRIDGE_POLICY"
 #: the Gloo bridge, and with it Gloo groups. Must match on every rank.
 BRIDGE_ENV = "GPUBRIDGE_BRIDGE"
 
+#: Set to ``1`` to let a job that didn't ask for Gloo start at torch's distributed debug
+#: level DETAIL (``TORCH_DISTRIBUTED_DEBUG=DETAIL``), where torch wraps every native
+#: group in a checker that runs on a Gloo helper group: the job then has Gloo groups and
+#: their threads after all, with the exit-abort exposure that comes with them. Without it
+#: such a job is refused at ``init()``. Also ``gpubridge.init(allow_debug_gloo=True)``.
+#: Must match on every rank.
+ALLOW_DEBUG_GLOO_ENV = "GPUBRIDGE_ALLOW_DEBUG_GLOO"
+
 #: torch's CPU backend: ``bridge="gloo"``'s groups, the ``flat-gloo`` policy's, and
 #: islands of several ranks in CPU simulation. No other job creates a group on it.
 CPU_BACKEND = "gloo"
@@ -92,6 +100,15 @@ def pinned_staging_setting() -> bool:
         ValueError: if the variable holds something other than a boolean word.
     """
     return _flag(PINNED_STAGING_ENV)
+
+
+def allow_debug_gloo_setting() -> bool:
+    """Return True when ``GPUBRIDGE_ALLOW_DEBUG_GLOO`` is set to a true value.
+
+    Raises:
+        ValueError: if the variable holds something other than a boolean word.
+    """
+    return _flag(ALLOW_DEBUG_GLOO_ENV)
 
 
 def bridge_compression_setting() -> str:

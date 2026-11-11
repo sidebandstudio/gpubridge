@@ -1,7 +1,7 @@
 """Startup and barriers through torch's c10d store, with no process group.
 
-A job on a bridge other than Gloo creates no Gloo group (docs/RUNTIME_INVENTORY.md,
-section 6), so nothing can carry a collective before the islands and the bridge
+On a bridge other than Gloo gpubridge creates no Gloo group
+(docs/RUNTIME_INVENTORY.md, section 6), so nothing can carry a collective before the islands and the bridge
 exist. What has to cross ranks before then goes through the job's c10d store, the
 key-value server ``torch.distributed`` starts for its own rendezvous (a TCPStore
 under torchrun, a FileStore for ``file://``), the way the bridges already exchange

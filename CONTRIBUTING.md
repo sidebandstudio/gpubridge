@@ -56,7 +56,8 @@ pytest
   change to the reference and needs its own reason.
 - A job that doesn't ask for Gloo must not create a Gloo group (`bridge="gloo"`,
   the `flat-gloo` policy and simulation's islands of several ranks are the
-  only askers), and a native thread must never touch a Python object
+  only askers; torch's debug level DETAIL would add Gloo helper groups, so it is
+  refused unless the job says `allow_debug_gloo`: `tests/test_debug_gloo.py`), and a native thread must never touch a Python object
   (`tests/test_no_gloo.py`, `tests/test_native_threads.py`).
 - New behavior that GPUs could change (speed, stream ordering, RDMA) gets a
   numbered item in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), and the

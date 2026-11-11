@@ -279,7 +279,23 @@ unless it asks for one.** Read this before upgrading a job.
   `bridge="gloo"` (opt-in, kept for one release: the whole job as it was
   before), by the `flat-gloo` policy (which makes its own group), and in CPU
   simulation for an island of several ranks, a test device. A GPU job on the
-  default has no thread named `pt_gloo_runloop` or `gloo_tcp_loop`.
+  default has no thread named `pt_gloo_runloop` or `gloo_tcp_loop`, with one
+  qualification, next.
+- **torch's debug level DETAIL is refused unless the job opts in.** At
+  `TORCH_DISTRIBUTED_DEBUG=DETAIL` (or `torch.distributed.set_debug_level`)
+  torch wraps every NCCL, RCCL or Gloo group it creates in a checker that runs
+  on a Gloo helper group, which would put Gloo and its worker threads back
+  into a job that never named it. `init()` (both APIs) now refuses a job that
+  didn't ask for Gloo at that level: on every rank, with one message that says
+  why and what to do, before any island group exists. Lower the level, or
+  accept the helper groups and their exit-abort exposure with
+  `gpubridge.init(allow_debug_gloo=True)` or `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`
+  (new; the same on every rank). gpubridge never changes the level. Not
+  covered: a level raised after `init()` (checked again only when a subgroup is
+  set up, and then on each member by itself). Tested on CPU with simulation's
+  Gloo islands standing in for NCCL ones (`tests/test_debug_gloo.py`); that
+  torch wraps an NCCL group the same way is read from torch 2.8.0 and 2.15.0,
+  not run on a GPU.
 - **Why.** On Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can abort
   a process at interpreter exit (signal 6, "terminate called without an active
   exception"), after training has finished; it reproduces with torch alone.

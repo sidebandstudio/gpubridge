@@ -9,7 +9,9 @@ Try that first on any new machine.
 
 **Which bridge a step runs on.** Since 2026-11-11 the library's default bridge
 is `auto` (the verbs bridge where every island leader has a usable RDMA device,
-else the TCP bridge), and a job creates no Gloo group unless it asks for Gloo.
+else the TCP bridge), and a job creates no Gloo group unless it asks for Gloo
+(with `TORCH_DISTRIBUTED_DEBUG=DETAIL` such a job is refused at `init()` unless
+it sets `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`: torch would add Gloo helper groups).
 The kit did not move with it: `check.py` and `bench_all_reduce.py` keep
 `--bridge gloo` as their default, so the steps built on them still measure the
 Gloo bridge, the path every result recorded so far was measured on. Steps that

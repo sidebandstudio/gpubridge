@@ -122,6 +122,7 @@ def init(
     timeout: timedelta | None = None,
     bridge: str | type[BridgeTransport] | None = None,
     policy: str | type[CollectivePolicy] = DEFAULT_POLICY,
+    allow_debug_gloo: bool | None = None,
 ) -> Topology:
     """Join the cluster and build the island and bridge groups.
 
@@ -136,8 +137,18 @@ def init(
     waiting. The default group is then gpubridge's own
     (:class:`gpubridge.torch_backend.GpubridgeProcessGroup`: ``torch.distributed``
     calls on it run through gpubridge), and :func:`barrier` counts through the
-    store: the job creates no Gloo group. Only ``bridge="gloo"`` makes the default
-    group a Gloo group of every rank, as every job's was through 0.4.0-alpha.
+    store: gpubridge creates no Gloo group for the job. Only ``bridge="gloo"`` makes
+    the default group a Gloo group of every rank, as every job's was through
+    0.4.0-alpha.
+
+    One thing outside gpubridge would bring Gloo back: at torch's distributed debug
+    level DETAIL (``TORCH_DISTRIBUTED_DEBUG=DETAIL``, or
+    ``torch.distributed.set_debug_level``), torch wraps every native island group in a
+    checker that runs on a Gloo helper group. A job that didn't ask for Gloo is
+    therefore refused at that level, on every rank with one message, before any island
+    group exists, unless it says ``allow_debug_gloo``. gpubridge never changes the
+    debug level, and a level raised after ``init()`` is seen only when a subgroup is
+    set up.
 
     The bridge between island leaders is one of gpubridge's Rust bridges unless the
     job names another: ``"auto"`` resolves, once and the same on every rank, to
@@ -162,6 +173,11 @@ def init(
             ``"flat-gloo"``) or a :class:`CollectivePolicy` subclass. Must be the
             same on every rank. ``"auto"`` picks ``native-only`` for one island
             and ``reduce-bridge-broadcast`` otherwise.
+        allow_debug_gloo: Accept torch's Gloo helper groups at debug level DETAIL
+            (above), and with them Gloo's worker threads and their exit-abort
+            exposure, instead of being refused. Must be the same on every rank. None
+            (the default) reads ``GPUBRIDGE_ALLOW_DEBUG_GLOO``, else False. It does
+            nothing at any other debug level.
 
     Returns:
         This rank's :class:`Topology`.
@@ -170,7 +186,9 @@ def init(
         RuntimeError: if gpubridge or torch.distributed is already initialized,
             if any rank reported a problem (no vendor, no GPU, no NCCL/RCCL
             backend), if ranks disagree on CPU mode, the bridge transport or the
-            collective policy, or if the policy doesn't apply to the cluster.
+            collective policy, if the policy doesn't apply to the cluster, or if
+            torch's debug level is DETAIL on a job that didn't ask for Gloo and
+            didn't say ``allow_debug_gloo``.
         TimeoutError: if a rank's discovery record doesn't arrive within ``timeout``.
         ValueError: for an unknown bridge or policy name, or invalid gpubridge env vars.
     """
@@ -187,7 +205,8 @@ def init(
     chosen = resolve_policy(policy)
     # torch.cuda.set_device waits until discovery has checked every rank's
     # device (build_topology): a bad index then fails init() on every rank.
-    local, config = _topology.describe_local(transport_name(transport), chosen)
+    local, config = _topology.describe_local(transport_name(transport), chosen,
+                                             allow_debug_gloo)
 
     # The store torch's own rendezvous would make, first: discovery runs on it before
     # any process group exists, so what every rank reports decides the groups.

@@ -21,6 +21,7 @@ from torch.distributed import ProcessGroup
 
 from gpubridge import rendezvous as _rendezvous
 from gpubridge.config import (
+    ALLOW_DEBUG_GLOO_ENV,
     BRIDGE_COMPRESSION_ENV,
     CPU_BACKEND,
     CPU_ONLY_ENV,
@@ -30,6 +31,7 @@ from gpubridge.config import (
     SPLIT_TEST_ENV,
     VENDOR_ENV,
     Config,
+    allow_debug_gloo_setting,
     bridge_compression_setting,
     gpu_identity,
     hostname,
@@ -167,6 +169,13 @@ class PeerInfo:
     """This rank's ``GPUBRIDGE_PINNED_STAGING``: stage the default bridge in pinned memory."""
     bridge_compression: str = ""
     """This rank's ``GPUBRIDGE_BRIDGE_COMPRESSION`` (``bf16`` or ``fp8``), or empty when off."""
+    debug_detail: bool = False
+    """Whether torch's distributed debug level was DETAIL on this rank when it described
+    itself (:func:`debug_detail`): torch then wraps every native group it creates in a
+    checker that runs on a Gloo helper group."""
+    allow_debug_gloo: bool = False
+    """This rank's ``allow_debug_gloo`` (``GPUBRIDGE_ALLOW_DEBUG_GLOO``): the job accepts
+    those Gloo helper groups instead of being refused (:func:`debug_gloo_problem`)."""
 
     @property
     def torch_version(self) -> str:
@@ -185,8 +194,16 @@ class PeerInfo:
         return cls(probe=Probe(**probe_data), **data)
 
 
+def debug_detail() -> bool:
+    """Whether torch's distributed debug level is DETAIL right now, however it got there
+    (``TORCH_DISTRIBUTED_DEBUG=DETAIL`` when torch was imported, or
+    ``torch.distributed.set_debug_level``)."""
+    return dist.get_debug_level() == dist.DebugLevel.DETAIL
+
+
 def describe_local(
-    bridge: str, policy: str | type[CollectivePolicy] = AUTO
+    bridge: str, policy: str | type[CollectivePolicy] = AUTO,
+    allow_debug_gloo: bool | None = None,
 ) -> tuple[PeerInfo, Config]:
     """Work out this rank's vendor, configuration and capabilities.
 
@@ -214,6 +231,12 @@ def describe_local(
     except ValueError as exc:
         compression = ""
         problems.append(str(exc))
+    if allow_debug_gloo is None:  # not passed to init(): the environment's
+        try:
+            allow_debug_gloo = allow_debug_gloo_setting()
+        except ValueError as exc:
+            allow_debug_gloo = False
+            problems.append(str(exc))
     vendor: str | None
     try:
         vendor = detect_vendor()
@@ -250,6 +273,8 @@ def describe_local(
         gpu=gpu_identity(config.device),
         pinned_staging=pinned,
         bridge_compression=compression,
+        debug_detail=debug_detail(),
+        allow_debug_gloo=bool(allow_debug_gloo),
     )
     return local, config
 
@@ -337,6 +362,14 @@ def validate_peers(peers: Sequence[PeerInfo], *, warn: bool = True) -> None:
         raise RuntimeError(
             f"Ranks disagree on {BRIDGE_COMPRESSION_ENV}: {detail}. Set it to the same value on "
             "every rank, or on none: it decides what the bridge sends."
+        )
+    allowed = [rank for rank, peer in enumerate(peers) if peer.allow_debug_gloo]
+    if allowed and len(allowed) != len(peers):
+        off = [rank for rank, peer in enumerate(peers) if not peer.allow_debug_gloo]
+        raise RuntimeError(
+            f"Ranks disagree on {ALLOW_DEBUG_GLOO_ENV} (allow_debug_gloo): on for ranks "
+            f"{allowed}, off for ranks {off}. Set it to the same value on every rank: it "
+            "decides whether the job may have torch's Gloo helper groups."
         )
     # CUDA and ROCm builds of one release differ only in the local version
     # suffix, e.g. 2.5.1+cu124 and 2.5.1+rocm6.2.
@@ -436,8 +469,18 @@ class Topology:
         """Whether this topology was set up without asking for Gloo: any bridge transport
         that isn't Gloo's. Its islands are then native groups, or in CPU simulation a
         :class:`~gpubridge.torch_backend.SoloGroup` for a one-rank island (a multi-rank
-        island there is still a Gloo group: simulation is a test device)."""
+        island there is still a Gloo group: simulation is a test device). It says what
+        the job asked for, not that the process holds no Gloo group: see
+        :attr:`debug_gloo`, and the ``flat-gloo`` policy makes its own."""
         return self.transport is None or not issubclass(self.transport, GlooTransport)
+
+    @property
+    def debug_gloo(self) -> bool:
+        """Whether the job started at torch's debug level DETAIL with
+        ``allow_debug_gloo``: torch then gave each native island group a Gloo helper
+        group, on a job that otherwise has none (:func:`debug_gloo_problem`)."""
+        local = self.peers[self.rank]
+        return self.gloo_free and local.debug_detail and local.allow_debug_gloo
 
     @property
     def world_size(self) -> int:
@@ -545,6 +588,57 @@ def _gpu_clash_error(lines: Sequence[str], split: str) -> str:
     return ("gpubridge cannot start: ranks of one island would share a GPU, and NCCL and "
             "RCCL refuse two ranks of one communicator on the same GPU.\n"
             + "\n".join(lines) + "\n" + hint)
+
+
+def _debug_refusal(where: str) -> str:
+    return (
+        f"gpubridge cannot start: torch's distributed debug level is DETAIL {where} "
+        "(TORCH_DISTRIBUTED_DEBUG=DETAIL, or torch.distributed.set_debug_level). At that "
+        "level torch wraps every NCCL, RCCL or Gloo process group it creates in a checker "
+        "that runs on a Gloo helper group of the same ranks. This job didn't ask for Gloo, "
+        "and its island groups would each bring one: Gloo groups and their worker threads "
+        "(pt_gloo_runloop), which gpubridge no longer creates unless asked, because such a "
+        "thread can abort a rank at interpreter exit (Python 3.12 with torch 2.10 to "
+        "2.15). Either lower the debug level on every rank (TORCH_DISTRIBUTED_DEBUG=INFO "
+        "or OFF), or accept the Gloo helper groups and that exposure for this job: pass "
+        f"allow_debug_gloo=True to gpubridge.init(), or set {ALLOW_DEBUG_GLOO_ENV}=1, on "
+        "every rank. gpubridge doesn't change the debug level itself."
+    )
+
+
+def debug_gloo_problem(peers: Sequence[PeerInfo], layout: Layout, config: Config,
+                       transport: str | type[BridgeTransport]) -> str | None:
+    """Why this job may not create its island groups at torch's debug level DETAIL, or
+    None if it may.
+
+    At DETAIL torch's ``new_group`` wraps a group of a C++ backend (NCCL, RCCL, Gloo) in
+    ``_ProcessGroupWrapper``, whose helper is a ``ProcessGroupGloo`` of the same ranks
+    (torch 2.8.0 and 2.15.0, ``_new_process_group_helper``): a job that named no Gloo
+    would have Gloo groups and threads. A group defined in Python (gpubridge's own, a
+    one-rank simulated island) is returned before that branch and is never wrapped.
+
+    Every rank computes this from the same ``peers`` and ``layout``, so every rank
+    refuses alike, before any island group exists. A job on ``bridge="gloo"`` is not
+    looked at (it has Gloo groups by request), nor is one whose islands are all Python
+    groups. A debug level raised after ``init()`` is not seen here.
+    """
+    detail = [rank for rank, peer in enumerate(peers) if peer.debug_detail]
+    if not detail or asks_for_gloo(transport):
+        return None
+    if all(island_backend(config, island, transport) == SOLO_BACKEND
+           for island in layout.islands):
+        return None
+    if not peers[0].allow_debug_gloo:  # the same on every rank (validate_peers)
+        return _debug_refusal(f"on ranks {detail}")
+    if len(detail) != len(peers):
+        off = [rank for rank, peer in enumerate(peers) if not peer.debug_detail]
+        return (
+            f"Ranks disagree on torch's distributed debug level: DETAIL on ranks {detail}, "
+            f"not on ranks {off}. At DETAIL torch gives each island group a Gloo helper "
+            "group that every member must create; set TORCH_DISTRIBUTED_DEBUG to the same "
+            "value on every rank."
+        )
+    return None
 
 
 def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | None,
@@ -692,6 +786,9 @@ def build_topology(
     clashes = gpu_clashes(layout, [peer.hostname for peer in peers], gpus)
     if clashes:
         raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
+    refused = debug_gloo_problem(peers, layout, config, transport)
+    if refused:
+        raise RuntimeError(refused)
     policy_cls = choose_policy(policy, layout)
     transport, selection = select_bridge(transport, layout, rank, scope, timeout)
     log.info("gpubridge: rank %d of %d, bridge %r (%s)", rank, len(peers), transport.name,
@@ -963,6 +1060,14 @@ def build_subtopology(world: Topology, ranks: Sequence[int], name: str,
         policy_cls = choose_policy(AUTO if asked == AUTO else type(world.policy), layout)
     rank = world.rank
     assert world.transport is not None
+    # The debug level as it is now: init() refused DETAIL (debug_gloo_problem), so this
+    # is a level raised since. Seen on this member only; the others see their own.
+    if (world.gloo_free and debug_detail() and not world.peers[rank].allow_debug_gloo
+            and any(island_backend(world.config, island, world.transport) != SOLO_BACKEND
+                    for island in layout.islands)):
+        raise RuntimeError(_debug_refusal(
+            f"on rank {rank}, raised after init(), when subgroup {name!r} of ranks "
+            f"{list(ranks)} was set up"))
     with _members_only(f"gpubridge:{name}"):
         group = cpu = None
         if not world.gloo_free:
