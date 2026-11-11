@@ -1110,6 +1110,8 @@ def _gpu_ddp(rank, world):
         g = p.grad.clone()
         dist.all_reduce(g, op=dist.ReduceOp.MAX)
         assert torch.equal(g, p.grad)  # identical on every rank
-    flags = torch.ones(1)  # a CPU tensor on a GPU job: Gloo carries it
+    # A CPU tensor on a GPU job: staged through this rank's GPU and carried by the
+    # topology (by a Gloo group of the backend's own with GPUBRIDGE_BRIDGE=gloo).
+    flags = torch.ones(1)
     dist.all_reduce(flags)
     assert flags.item() == world
