@@ -190,7 +190,10 @@ def init(
             torch's debug level is DETAIL on a job that didn't ask for Gloo and
             didn't say ``allow_debug_gloo``.
         TimeoutError: if a rank's discovery record doesn't arrive within ``timeout``.
-        ValueError: for an unknown bridge or policy name, or invalid gpubridge env vars.
+        ValueError: for an unknown bridge or policy name, or invalid gpubridge env vars,
+            on the rank that has them. That rank first publishes the error as its
+            discovery record, so every other rank raises RuntimeError with its
+            message instead of waiting for it.
     """
     if is_initialized():
         raise RuntimeError("gpubridge is already initialized")
@@ -199,14 +202,20 @@ def init(
             "torch.distributed is already initialized; gpubridge.init() creates the "
             "default process group itself"
         )
-    if bridge is None:
-        bridge = os.environ.get(BRIDGE_ENV, "").strip() or DEFAULT_TRANSPORT
-    transport = resolve_transport(bridge)
-    chosen = resolve_policy(policy)
-    # torch.cuda.set_device waits until discovery has checked every rank's
-    # device (build_topology): a bad index then fails init() on every rank.
-    local, config = _topology.describe_local(transport_name(transport), chosen,
-                                             allow_debug_gloo)
+    try:
+        if bridge is None:
+            bridge = os.environ.get(BRIDGE_ENV, "").strip() or DEFAULT_TRANSPORT
+        transport = resolve_transport(bridge)
+        chosen = resolve_policy(policy)
+        # torch.cuda.set_device waits until discovery has checked every rank's
+        # device (build_topology): a bad index then fails init() on every rank.
+        local, config = _topology.describe_local(transport_name(transport), chosen,
+                                                 allow_debug_gloo)
+    except Exception as exc:
+        # A name this rank can't resolve, a module it can't import, a setting it can't
+        # read: the other ranks are about to wait for this rank's discovery record.
+        _publish_failure(exc, init_method, rank, world_size, timeout)
+        raise
 
     # The store torch's own rendezvous would make, first: discovery runs on it before
     # any process group exists, so what every rank reports decides the groups.
@@ -232,6 +241,29 @@ def init(
     _observe._reset()
     _topology._set_topology(topology)
     return topology
+
+
+def _publish_failure(exc: Exception, init_method: str | None, rank: int | None,
+                     world_size: int | None, timeout: timedelta | None) -> None:
+    """Tell the other ranks that this one cannot even describe itself, before
+    :func:`init` raises ``exc`` here: its discovery record is the error, so they fail
+    with this rank's message instead of waiting for a record until their timeout (the
+    way the torch.distributed backend's setup has always reported a bad setting).
+
+    This rank takes part in discovery like any other, so it stays until every rank has
+    published (a rank 0 that left at once would take a TCP store with it), or until
+    the timeout if the others never come. Nothing is raised from here: if the job's
+    store can't be reached (no rendezvous given, as in a script run by hand), there is
+    nobody to tell, and ``init()`` raises ``exc`` either way.
+    """
+    problem = _topology.failure_text(exc)
+    try:
+        store, rank, world_size = _rendezvous.open_store(init_method, rank, world_size, timeout)
+        scope = f"world{next(_torch_backend._world_setups)}"
+        _topology.discover(store, scope, rank, world_size, None, timeout, problem=problem)
+    except Exception as told:  # noqa: BLE001 - the error to raise is the caller's
+        _log.debug("gpubridge: after %s, discovery ended with %s: %s", problem,
+                   type(told).__name__, told)
 
 
 def destroy() -> None:

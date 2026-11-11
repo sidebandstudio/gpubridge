@@ -641,6 +641,15 @@ def debug_gloo_problem(peers: Sequence[PeerInfo], layout: Layout, config: Config
     return None
 
 
+def failure_text(exc: BaseException) -> str:
+    """What a rank that failed before it could describe itself publishes as its
+    discovery record's error: the message of a bad name or setting as it is, anything
+    else (a failed import, say) with its type."""
+    if isinstance(exc, ValueError | TypeError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | None,
              timeout: timedelta | None, *, problem: str | None = None) -> tuple[PeerInfo, ...]:
     """Exchange every rank's :class:`PeerInfo` through the c10d store.

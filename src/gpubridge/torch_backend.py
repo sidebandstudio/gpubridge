@@ -957,8 +957,8 @@ def setup(timeout: timedelta | None) -> dist.ProcessGroup | None:
                                       or DEFAULT_TRANSPORT)
         chosen = resolve_policy(os.environ.get(POLICY_ENV, "").strip() or DEFAULT_POLICY)
         local, config = _topology.describe_local(transport_name(transport), chosen)
-    except (ValueError, TypeError) as exc:
-        problem = str(exc)
+    except Exception as exc:  # noqa: BLE001 - whatever it is, every rank must hear of it
+        problem = _topology.failure_text(exc)
     peers = _topology.discover(_rendezvous.default_store(), scope, dist.get_rank(),
                                dist.get_world_size(), local, timeout, problem=problem)
     assert problem is None  # discover() raised on every rank otherwise

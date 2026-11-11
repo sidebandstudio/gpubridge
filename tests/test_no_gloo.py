@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import time
 from datetime import timedelta
@@ -37,7 +38,7 @@ from _harness import (
 
 import gpubridge
 from gpubridge import multitcp, rendezvous, torch_backend
-from gpubridge.config import BRIDGE_ENV, SOLO_BACKEND, VENDOR_ENV
+from gpubridge.config import BRIDGE_ENV, SOLO_BACKEND, SPLIT_TEST_ENV, VENDOR_ENV
 from gpubridge.multitcp.transport import IFNAME_ENV, STREAMS_ENV
 from gpubridge.policies import FlatGloo
 
@@ -293,6 +294,75 @@ def test_ranks_that_ask_for_different_bridges_fail_init_before_any_group_exists(
          {"env": {VENDOR_ENV: "amd", **LOCAL}, "init_kwargs": {"bridge": "multitcp"}}],
         tmp_path, [r"Ranks picked different bridge transports: 'gloo' on ranks \[0\]; "
                    r"'tcp' on ranks \[1\]"])
+
+
+def _one_rank_cannot_describe_itself(rank, init_file, bad_rank, bad, patterns):
+    """Three ranks; ``bad_rank`` has something it can't resolve. It must raise its own
+    error (a ValueError), the others a RuntimeError carrying its message, all of them
+    well inside the timeout."""
+    os.environ.update({VENDOR_ENV: ("nvidia", "amd", "nvidia")[rank], **LOCAL})
+    kwargs = {"bridge": "tcp"}
+    if rank == bad_rank:
+        os.environ.update(bad.get("env", {}))
+        kwargs.update(bad.get("kwargs", {}))
+        if bad.get("unimportable"):
+            gpubridge.transport._BUILT_IN[bad["unimportable"]] = "gpubridge._no_such_module"
+    torch.set_num_threads(1)
+    started = time.monotonic()
+    try:
+        gpubridge.init(init_method=f"file://{init_file}", rank=rank, world_size=3,
+                       timeout=TIMEOUT, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - which one is what this checks
+        waited = time.monotonic() - started
+        message = str(exc)
+        if rank == bad_rank:
+            assert type(exc) is ValueError, f"rank {rank}: {type(exc).__name__}: {exc}"
+        else:
+            assert type(exc) is RuntimeError, f"rank {rank}: {type(exc).__name__}: {exc}"
+            assert f"1 of 3 ranks reported problems.\n  rank {bad_rank}: " in message, message
+        for pattern in patterns:
+            assert re.search(pattern, message), f"rank {rank}: {pattern!r} not in:\n{message}"
+        assert waited < TIMEOUT.total_seconds() / 2, f"rank {rank} waited {waited:.1f} s"
+    else:
+        gpubridge.destroy()
+        raise AssertionError(f"rank {rank}: gpubridge.init() unexpectedly succeeded")
+    assert not gpubridge.is_initialized() and not dist.is_initialized()
+    assert gloo_groups() == []
+
+
+@pytest.mark.parametrize(("bad_rank", "bad", "patterns"), [
+    (1, {"kwargs": {"bridge": "typo"}}, [r"unknown bridge transport 'typo'"]),
+    (0, {"kwargs": {"bridge": "typo"}}, [r"unknown bridge transport 'typo'"]),
+    (2, {"kwargs": {"policy": "no-such-policy"}}, [r"unknown collective policy"]),
+    (1, {"kwargs": {"bridge": "broken"}, "unimportable": "broken"},
+     [r"bridge transport 'broken' can't be loaded"]),
+    (1, {"env": {SPLIT_TEST_ENV: "sideways"}}, [rf"{SPLIT_TEST_ENV}='sideways' is not valid"]),
+], ids=["bridge-name", "bridge-name-on-rank-0", "policy-name", "failed-import", "setting"])
+def test_a_rank_that_cannot_resolve_its_settings_fails_init_on_every_rank_at_once(
+        bad_rank, bad, patterns, tmp_path):
+    # Not the mismatch below (two valid names that differ): here one rank's name or
+    # setting is malformed, so it fails before it has anything to report. It used to
+    # raise alone, and the others waited for its record until the timeout (30 minutes by
+    # default); now its record is the error.
+    mp.spawn(_one_rank_cannot_describe_itself,
+             args=(str(tmp_path / "rendezvous"), bad_rank, bad, patterns), nprocs=3)
+
+
+def test_init_with_no_rendezvous_still_raises_the_setting_error_itself(monkeypatch):
+    # Nobody to tell (no store can be opened): the error is the caller's own, at once.
+    for name in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="unknown bridge transport 'carrier-pigeon'"):
+        gpubridge.init(bridge="carrier-pigeon")
+    assert time.monotonic() - started < 5
+    assert not gpubridge.is_initialized() and not dist.is_initialized()
+
+
+def test_what_a_failed_rank_publishes():
+    assert gpubridge.topology.failure_text(ValueError("bad name")) == "bad name"
+    assert gpubridge.topology.failure_text(TypeError("not a class")) == "not a class"
+    assert gpubridge.topology.failure_text(ImportError("no libfoo")) == "ImportError: no libfoo"
 
 
 # ---- the solo group ---------------------------------------------------------------------
