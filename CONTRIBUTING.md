@@ -19,8 +19,18 @@ uv pip install -e ".[test]"
 pytest
 ```
 
+- **cargo is needed.** The default bridge is a Rust library, built on first use
+  (`python -m gpubridge.multitcp build`; a Rust toolchain from
+  https://rustup.rs, no network). Without it, every test of a mixed layout that
+  names no bridge fails at `init()` saying so.
+- **Both defaults.** `pytest` runs the suite on the default bridge (`auto`: the
+  TCP bridge on a machine without RDMA). `GPUBRIDGE_BRIDGE=gloo pytest` runs it
+  again with every job that names no bridge on the Gloo bridge, the path the
+  GPU results were measured on. Both must pass.
+
 - **What CI runs:** Python 3.10 with torch 2.8.0 and Python 3.12 with the
-  newest torch, both with Triton installed. `shellcheck` covers the job
+  newest torch, both with Triton installed, and the 3.12 suite a second time
+  with `GPUBRIDGE_BRIDGE=gloo`. `shellcheck` covers the job
   scripts, and a separate job runs `tests/test_ucx.py` over UCX's TCP
   transport.
 - **Triton is optional.** Without it, the compression kernel tests skip. Set
@@ -39,7 +49,15 @@ pytest
 - Keep a pull request to one change, with tests for it. A change to how data
   travels must keep every collective bit for bit equal to `flat-gloo`, the
   reference policy, unless it is opt-in and documented as changing results
-  (as bridge compression is).
+  (as bridge compression is). A bridge transport must also reproduce
+  `tests/data/bridge_parity.json`, the hashes the Gloo bridge generated, in a
+  job with no Gloo group (`tests/test_parity_fixture.py`). That file is
+  written once: regenerating it (`python tests/_parity.py generate`) is a
+  change to the reference and needs its own reason.
+- A job that doesn't ask for Gloo must not create a Gloo group (`bridge="gloo"`,
+  the `flat-gloo` policy and simulation's islands of several ranks are the
+  only askers), and a native thread must never touch a Python object
+  (`tests/test_no_gloo.py`, `tests/test_native_threads.py`).
 - New behavior that GPUs could change (speed, stream ordering, RDMA) gets a
   numbered item in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), and the
   docs say "not validated on GPUs" until a run shows it.

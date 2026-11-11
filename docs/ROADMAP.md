@@ -1,5 +1,10 @@
 # Roadmap: designs waiting on GPU results
 
+(Since 2026-11-11 the default bridge is `bridge="auto"`, one of the Rust bridges
+of section 2, and Gloo is opt-in: docs/RUNTIME_INVENTORY.md, section 6. Where the
+sections below say "the default bridge" or "Gloo over TCP" for the bridge step,
+they describe the job as it was when they were written.)
+
 These are designs, not commitments. All three now have experimental
 implementations, tested on CPU and, so far, on few and narrow GPU runs (each
 status below says which). Each one

@@ -2,7 +2,9 @@
 
 Each process fakes its vendor with GPUBRIDGE_VENDOR, so gpubridge runs the
 same discovery, leader election and reduce-bridge-broadcast as on real
-hardware, with Gloo standing in for NCCL and RCCL.
+hardware, with Gloo standing in for NCCL and RCCL inside the islands. The
+bridge is the default one: without an RDMA device, the Rust TCP bridge, built
+with cargo on first use.
 
     python examples/simulate_two_islands.py
 """

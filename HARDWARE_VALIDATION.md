@@ -714,6 +714,114 @@ only real GPUs or NICs can check. Each names the kit step that checks it.
     cannot infer its acceptance from training exits. Representative GPT
     numerical equivalence remains unproven.
 
+44. **A job with no Gloo group starts and runs on GPUs.** Since 2026-11-11 a job
+    that doesn't ask for Gloo (`bridge="auto"`, `"tcp"`, `"verbs"`, `"ucx"`)
+    has no Gloo process group: discovery is a record per rank in the job's
+    c10d store, the default process group is gpubridge's own
+    (`GpubridgeProcessGroup`), and the NCCL/RCCL island groups are created
+    under it by their own members (`new_group(backend="nccl",
+    use_local_synchronization=True)` with gpubridge's group names). Check, on
+    one vendor, in a split test and on real NVIDIA + AMD ranks, on torch 2.8
+    with Python 3.10 and on torch 2.14 or 2.15 with Python 3.12:
+    `gpubridge.init()` returns on every rank; `topology.gloo_free` is true and
+    `dist.get_backend()` is `gpubridge`; every collective of `check.py` is
+    exact; and no rank has a thread named `pt_gloo_runloop` or `gloo_tcp_loop`
+    (`cat /proc/<pid>/task/*/comm` on each rank after its first collectives). A
+    rank with no GPU, a `LOCAL_RANK` with no GPU behind it and ranks that ask
+    for different bridges must still fail `init()` on every rank with one
+    message. *Status: tested on CPU (`tests/test_no_gloo.py`, and every
+    existing suite on the default). NCCL island groups under gpubridge's own
+    default group are what `backend="gpubridge"` has always created, and that
+    ran on GPUs at `c92684b` (torch 2.14.1, two 2-GPU V100 islands, with the
+    Gloo bridge and the Gloo groups of every rank beside them). Not run on a
+    GPU: the same under `gpubridge.init()`, without any Gloo group, on torch
+    2.8 or 2.15, on AMD or mixed.* *Step:* `check.py --bridge auto` in each
+    kit step that runs `check.py` (the kit's own default stays `--bridge
+    gloo`, the path its recorded results were measured on).
+
+45. **`barrier()` through the c10d store.** Without a Gloo group, `barrier()`
+    is a counter in the store that every rank adds to and then watches, with
+    pauses from 50 µs doubling to 2 ms between looks. Check that
+    `check.py barrier` passes, and measure one barrier's time against the Gloo
+    barrier's (`--bridge gloo`) at 2, 4 and as many ranks as the job has: each
+    look is a round trip to the store, which is on rank 0's node. *Status:
+    tested on CPU (it returns only once the last rank arrives; a missing rank
+    times out saying how many arrived). Its cost between machines, and with
+    many ranks, is not measured.* *Step:* `check.py barrier` with `--bridge
+    auto`; no timing step yet.
+
+46. **CPU tensors through the backend on a GPU job, without Gloo.** A
+    collective on CPU tensors in a GPU job (object collectives such as
+    `all_gather_object`, a library's CPU flags) used to go to a Gloo group of
+    the backend's own. It is now staged: a copy on the rank's GPU, the gpubridge
+    collective, a copy back before the returned Work completes; `gather` and
+    `scatter` run as an all-gather and a broadcast of bytes. Check on GPUs that
+    `all_gather_object`, `broadcast_object_list`, `gather_object` and
+    `scatter_object_list` return every rank's object, that an `all_reduce` of a
+    CPU tensor is exact, and that the result is there when `wait()` returns
+    (the copy back runs on gpubridge's worker stream). The same on the default
+    group after `gpubridge.init()`. *Status: tested on CPU with the staging
+    forced and a clone standing in for the device copy
+    (`tests/test_no_gloo.py`); never run on a GPU.* *Step:* `gpu_tests`
+    (`test_gpu_ddp_on_two_gpus_split_into_two_islands` all-reduces a CPU tensor
+    through the backend, which now takes this path); the object collectives
+    have no GPU step yet.
+
+47. **The TCP bridge as the default: collectives and point-to-point between
+    machines.** `bridge="tcp"` (the Rust library, `multitcp` until now) is what
+    `auto` runs on between a V100 node and the MI50 node. Check that every
+    policy of `check.py --bridge tcp` is exact; that the leaders listen on the
+    intended interface (`GPUBRIDGE_MULTITCP_IFNAME`, else the route to
+    `MASTER_ADDR`: `topology.bridge.telemetry()["address"]`); that
+    `check_p2p` and `bench_p2p.py` pass with `GPUBRIDGE_BRIDGE=tcp`, whose
+    cross-island messages run over the new TCP lanes; and the bridge's time
+    against the Gloo bridge's (step 08's `D-multitcp` rows are the same bridge
+    by its older name). *Status: collectives ran between a V100 and an MI50 at
+    23180fe by name, beside a Gloo default group (0.88 to 1.07 times the pinned
+    Gloo bridge's time). As the default, and the TCP point-to-point lanes: CPU
+    only (`tests/test_multitcp.py`, `tests/test_p2p.py`).* *Step:* `check.py`,
+    `check_p2p` and step 08 with `--bridge tcp` / `GPUBRIDGE_BRIDGE=tcp`.
+
+48. **`bridge="auto"` on real RDMA devices.** `auto` asks each island leader
+    whether the verbs bridge could run there (`gpubridge.verbs.availability()`:
+    the library loads or builds, an endpoint opens on a device with an active
+    port and an address) and picks `verbs` only if every leader can and all are
+    on one link layer. Check on a V100 pair (InfiniBand on both) that it picks
+    `verbs`, and on a V100 + MI50 pair (InfiniBand and RoCE) that it picks `tcp`
+    with that reason, the same on every rank (`topology.selection`); that the
+    probe's open and close of an endpoint leaves the device usable for the
+    bridge that follows; and what the probe costs at `init()`. Where `auto`
+    picks verbs and the leaders then can't connect (two fabrics of one link
+    layer), `init()` fails on every rank and names `bridge="tcp"`: check the
+    message. *Status: the rule and the reports are tested on CPU with fixed
+    reports, and the bridge it picks on the MOCK fabric
+    (`tests/test_bridge_selection.py`); the device check has never met an RDMA
+    device.* *Step:* `check.py --bridge auto` in steps 05 and 07.
+
+49. **A rank that exits without `destroy()` on GPUs.** An exit handler closes
+    the bridge (joining its native threads) and, on a job without Gloo,
+    destroys the process groups, NCCL/RCCL islands included, before the
+    interpreter finalizes. Check that a training script that returns without
+    `gpubridge.destroy()` exits 0 on every rank, repeatedly (the CPU run is
+    300 repetitions: `scripts/exit_abort.py`), on Python 3.12 with the
+    cluster's torch; and the same script with `GPUBRIDGE_BRIDGE=gloo` as the
+    control. *Status: on CPU (Linux, Python 3.12.3, torch 2.15.0) the TCP arm
+    had no bad exit in 300 repetitions with and without `destroy()`; the
+    CHANGELOG has both arms' counts. Never run on a GPU: whether NCCL's or
+    RCCL's own threads can need the GIL at exit is not established.* *Step:*
+    none yet.
+
+50. **The Rust bridges give Gloo's results on GPUs.** On CPU every bridge
+    reproduces hashes the Gloo bridge generated (`tests/test_parity_fixture.py`)
+    in jobs with no Gloo group. On GPUs the bridge sees the same host bytes
+    (staged by the policy for `tcp`; staged or direct for `verbs`), so the
+    check is the kit's exactness against `flat-gloo` (`check.py`, which makes
+    its own Gloo group for the reference) and the numerical gate with a `tcp`
+    arm beside `gloo` and `verbs`. *Status: staged verbs was exact against Gloo
+    on one node (`c92684b`, item 39); the TCP bridge's GPU jobs at 23180fe were
+    timing runs. The numerical gate has no `tcp` arm yet.* *Step:* `check.py
+    --bridge tcp`; a gate arm to add.
+
 32. **Point-to-point across islands through the backend on GPUs.** `send`,
     `recv`, `isend`, `irecv` and `batch_isend_irecv` on `backend="gpubridge"`
     go native within an island and through the bridge across islands. On GPUs,

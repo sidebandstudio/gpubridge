@@ -35,7 +35,7 @@ Compression sends fewer bytes there, and only there. Island steps
   jobs (no bridge). A mode also skips dtypes it wouldn't shrink: `bf16`
   compresses float32 and float64 only, while `fp8` also compresses float16
   and bfloat16.
-- **Both bridge transports:** Gloo (the default) and UCX (`bridge="ucx"`).
+- **Every built-in bridge transport:** the TCP and verbs bridges (what the default, `auto`, is), Gloo and UCX (`bridge="ucx"`).
   With UCX on a GPU leader the payloads go straight from GPU memory, with no
   host copy.
 

@@ -7,6 +7,19 @@ command, and every step writes its records to `results/<target>/`. Every shell
 script accepts `--dry-run`, which prints the commands without running them.
 Try that first on any new machine.
 
+**Which bridge a step runs on.** Since 2026-11-11 the library's default bridge
+is `auto` (the verbs bridge where every island leader has a usable RDMA device,
+else the TCP bridge), and a job creates no Gloo group unless it asks for Gloo.
+The kit did not move with it: `check.py` and `bench_all_reduce.py` keep
+`--bridge gloo` as their default, so the steps built on them still measure the
+Gloo bridge, the path every result recorded so far was measured on. Steps that
+name no bridge (`train_dp.py`, `train_bench.py` without `--bridge`, the
+point-to-point and pipeline scripts) follow `GPUBRIDGE_BRIDGE` and otherwise
+run on `auto`; each record's `run.bridge` says what the run used, beside
+`bridge_requested` and `bridge_selection`. To repeat an earlier result exactly,
+set `GPUBRIDGE_BRIDGE=gloo`. What the new default itself still needs from GPUs
+is HARDWARE_VALIDATION.md items 44 to 50, none of which has a kit step yet.
+
 **Before an allocation.** `pytest tests/test_gpu_jobs.py` runs every job script
 end to end on CPU, against a fake Slurm (`tests/fake_cluster`: sbatch, srun,
 scontrol, module, uv) and gpubridge's simulation mode: `submit.sh` through each

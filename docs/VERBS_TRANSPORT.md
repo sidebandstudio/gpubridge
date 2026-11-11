@@ -753,8 +753,13 @@ not discard accepted work. Wait for accepted work before retrying, preserving th
 same collective order on every rank. The limit bounds queue entries/tensor
 references, not tensor bytes; users must budget outstanding tensor memory too.
 
-`bridge="verbs"` (`src/gpubridge/verbs/transport.py`), opt-in; the default
-stays Gloo, and UCX and multitcp are unchanged. `device_tensors` is True: GPU
+`bridge="verbs"` (`src/gpubridge/verbs/transport.py`): by name, or since
+2026-11-11 what the default `bridge="auto"` resolves to when every island leader
+passes `gpubridge.verbs.availability()` (the library loads or builds, an
+endpoint opens on this process's `GPUBRIDGE_VERBS_*` settings: a device, an
+active port, an address; the MOCK test fabric never counts) and all leaders are
+on one link layer. Otherwise `auto` is the TCP bridge. A job on verbs creates no
+Gloo group. `device_tensors` is True: GPU
 leaders hand GPU tensors straight to it, and it moves them direct or staged
 (["GPU memory"](#gpu-memory)). Its collectives are
 `gpubridge.tagged.TaggedBridge`'s, shared with `bridge="multitcp"`: with two
@@ -781,8 +786,9 @@ The library is built like multitcp's: `python -m gpubridge.verbs build`
 (Linux, the `ibverbs` feature, rdma-core's headers; `GPUBRIDGE_VERBS_LIB` for a
 library built elsewhere), and `python -m gpubridge.verbs info` loads it without
 opening a device. If it can't be built or loaded, or there is no usable device
-or port, setup fails on every rank with the reason. Payload never moves any
-other way: another bridge is only ever chosen explicitly.
+or port, setup fails on every rank with the reason. Once verbs is the job's
+bridge, by name or by `auto`'s choice at `init()`, payload never moves any
+other way. (`auto` decides before any bridge exists; it never switches after.)
 
 ## Hardware kit
 

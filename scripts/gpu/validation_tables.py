@@ -150,6 +150,22 @@ ITEMS: dict[int, tuple[str, list[Step | Stage | Manual]]] = {
          [Step("train_verbs"), Step("train_gloo")]),
     43: ("Deterministic numerical comparison before performance",
          [Manual("numerical_gate.py --compare")]),
+    # 44 to 50: a job without Gloo, and bridge="auto" as the default (2026-11-11). No
+    # kit step judges them yet: each is a check to run by hand and record.
+    44: ("A job with no Gloo group starts and runs on GPUs",
+         [Manual("check.py --bridge auto, and no Gloo thread on any rank")]),
+    45: ("`barrier()` through the c10d store",
+         [Manual("check.py barrier --bridge auto, timed against --bridge gloo")]),
+    46: ("CPU tensors through the backend on a GPU job, without Gloo",
+         [Manual("object collectives on backend=gpubridge without GPUBRIDGE_BRIDGE=gloo")]),
+    47: ("The TCP bridge as the default: collectives and point-to-point between machines",
+         [Manual("check.py, check_p2p and step 08 with the tcp bridge")]),
+    48: ('`bridge="auto"` on real RDMA devices',
+         [Manual("check.py --bridge auto on an RDMA pair and on InfiniBand + RoCE")]),
+    49: ("A rank that exits without `destroy()` on GPUs",
+         [Manual("a training script without destroy(), repeated; gloo as the control")]),
+    50: ("The Rust bridges give Gloo's results on GPUs",
+         [Manual("check.py --bridge tcp; a tcp arm of numerical_gate.py")]),
 }
 
 

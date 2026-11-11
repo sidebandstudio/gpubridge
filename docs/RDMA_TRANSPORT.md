@@ -12,7 +12,9 @@ A new `BridgeTransport` that carries the island leaders' bridge step over
 RDMA (InfiniBand or RoCE). Where the hardware and drivers allow it, data
 should go from GPU memory on one vendor's leader to GPU memory on the
 other's, using GPUDirect RDMA on NVIDIA and ROCm peer memory or dma-buf on
-AMD. The Gloo bridge stays the default and the fallback. Every policy keeps
+AMD. When this was written the Gloo bridge was the default, and what a job
+without UCX stayed on; since 2026-11-11 the default is `bridge="auto"` (a Rust
+bridge) and Gloo is opt-in (docs/RUNTIME_INVENTORY.md, section 6). Every policy keeps
 working unchanged, and so does every job that doesn't ask for the new
 transport.
 
