@@ -8,19 +8,30 @@ the others': that rank would get a network error from a store that is gone, not 
 reason. Each rank therefore marks that it has read, and rank 0 waits for the marks
 before it raises (``gpubridge.rendezvous.await_readers``).
 
-These jobs pin that interleaving instead of hoping for it: two ranks on a real TCP
-store that rank 0 hosts; rank 1 is held, through the test seam
-``gpubridge.rendezvous._after_publish``, after its discovery record is in the store
-and before it reads; rank 0 raises as soon as the code lets it and its process ends at
-once. Both ranks must report the intended reason, promptly, with no group left. The
-file-store tests of the same refusals (tests/test_no_gloo.py, tests/test_debug_gloo.py)
-cannot see this: a file outlives its ranks.
+These jobs pin that interleaving with events between the test and its two ranks, not
+with a sleep, on a real TCP store that rank 0 hosts:
+
+1. rank 1 publishes its discovery record, says so (``published``) and stops, through the
+   test seam ``gpubridge.rendezvous._after_publish``, before it reads anything;
+2. the test waits until rank 0 has gone as far as the code lets it while rank 1 is
+   stopped: it is waiting for rank 1's mark (``holding``, set as rank 0 enters
+   ``await_readers``), or, on code without that wait, its process has ended and taken
+   the store with it;
+3. only then does the test release rank 1, which reads, or tries to.
+
+So the order is the same in every run: nothing depends on how long anything takes.
+Every wait is bounded and fails the test when it runs out. Both ranks must then report
+the intended reason, with no group left; that both are done in ``PROMPT`` seconds is a
+watchdog, not the evidence of the order. The file-store tests of the same refusals
+(tests/test_no_gloo.py, tests/test_debug_gloo.py) cannot see any of this: a file
+outlives its ranks.
 """
 
 from __future__ import annotations
 
 import json
 import multiprocessing
+import multiprocessing.connection
 import os
 import random
 import re
@@ -36,10 +47,10 @@ from _harness import TIMEOUT, gloo_groups
 import gpubridge
 from gpubridge.config import ALLOW_DEBUG_GLOO_ENV, BRIDGE_ENV, VENDOR_ENV
 
-#: How long rank 1 is held between publishing and reading: far longer than rank 0 needs
-#: to read both records, raise and end.
-HELD = 2.0
-#: Both ranks must be done well inside the job's 60 s timeout.
+#: The longest the test waits for each step of the schedule before it gives up.
+STEP = 60.0
+#: A watchdog: both ranks must be done well inside the job's 60 s timeout once rank 1
+#: is released. It says nothing about the order of events; the events do.
 PROMPT = 30.0
 
 
@@ -57,22 +68,31 @@ def _port() -> int:
     raise RuntimeError("no free port between 20000 and 30000")
 
 
-def _rank(rank, port, case, out):
-    """One rank of two. Writes what its ``init`` raised, how long it took and what was
-    left, then returns: the process ends at once, and with rank 0 the store."""
+def _rank(rank, port, case, out, published, holding, release):
+    """One rank of two. Writes what its ``init`` raised and what was left, then returns:
+    the process ends at once, and with rank 0 the store."""
     os.environ[VENDOR_ENV] = case["vendors"][rank]
     os.environ.pop(ALLOW_DEBUG_GLOO_ENV, None)
     os.environ.update(case.get("env", [{}, {}])[rank])
     torch.set_num_threads(1)
     if case.get("detail"):
         dist.set_debug_level(dist.DebugLevel.DETAIL)
-    held = []
+    stopped = []
     if rank == 1:
-        def hold(prefix, who):
-            if prefix.endswith("/peer") and not held:  # the discovery record, once
-                held.append(time.monotonic())
-                time.sleep(HELD)
-        gpubridge.rendezvous._after_publish = hold
+        def stop(prefix, who):
+            if prefix.endswith("/peer") and not stopped:  # the discovery record, once
+                published.set()
+                stopped.append(release.wait(2 * STEP))  # True: the test released it
+        gpubridge.rendezvous._after_publish = stop
+    elif hasattr(gpubridge.rendezvous, "await_readers"):
+        # Rank 0 says when it starts to wait for the others' marks. (Code that has no
+        # such wait never says so: the test then sees its process end instead.)
+        plain = gpubridge.rendezvous.await_readers
+
+        def waiting(*args, **kwargs):
+            holding.set()
+            return plain(*args, **kwargs)
+        gpubridge.rendezvous.await_readers = waiting
     url = f"tcp://127.0.0.1:{port}"
     started = time.monotonic()
     result = {"rank": rank}
@@ -88,47 +108,73 @@ def _rank(rank, port, case, out):
         result.update(error=None)
     except Exception as exc:  # noqa: BLE001 - which one is what the test checks
         result.update(error=type(exc).__name__, message=str(exc))
-    result.update(seconds=time.monotonic() - started, held=bool(held),
+    result.update(seconds=time.monotonic() - started, released=stopped == [True],
                   gloo_groups=gloo_groups(), gpubridge=gpubridge.is_initialized())
     Path(out, f"rank{rank}.json").write_text(json.dumps(result))
     # And nothing else. No destroy, no wait: rank 0 is gone as soon as it has raised.
 
 
 def _run(case, tmp_path):
+    """Run the two ranks through the schedule; their results, and what the test saw
+    rank 0 do before it released rank 1 (``"waited for the marks"`` or ``"exited"``)."""
     ctx = multiprocessing.get_context("spawn")
     port = _port()
-    ranks = [ctx.Process(target=_rank, args=(rank, port, case, str(tmp_path))) for rank in (0, 1)]
+    published, holding, release = ctx.Event(), ctx.Event(), ctx.Event()
+    ranks = [ctx.Process(target=_rank, args=(rank, port, case, str(tmp_path), published,
+                                             holding, release)) for rank in (0, 1)]
     for process in ranks:
         process.start()
-    for process in ranks:
-        process.join(TIMEOUT.total_seconds() * 2)
-        if process.is_alive():
-            process.kill()
+    try:
+        # 1. Rank 1's record is in the store, and rank 1 has stopped before reading.
+        assert published.wait(STEP), "rank 1 never published its discovery record"
+        # 2. Rank 0 goes as far as it can without rank 1: into the wait for the marks,
+        #    or out of existence.
+        seen, deadline = None, time.monotonic() + STEP
+        while seen is None and time.monotonic() < deadline:
+            if holding.is_set():
+                seen = "waited for the marks"
+            elif multiprocessing.connection.wait([ranks[0].sentinel], timeout=0.02):
+                seen = "exited"
+        assert seen is not None, "rank 0 neither waited for the marks nor ended"
+        alive = ranks[0].is_alive()
+        # 3. Only now may rank 1 read.
+        release.set()
+        released = time.monotonic()
+        for process in ranks:
+            process.join(max(0.0, released + 2 * PROMPT - time.monotonic()))
+        took = time.monotonic() - released
+    finally:
+        release.set()
+        for process in ranks:
+            if process.is_alive():
+                process.kill()
             process.join()
-    return [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in (0, 1)]
+    results = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in (0, 1)]
+    return results, {"rank 0": seen, "rank 0 alive at the release": alive, "seconds": took}
 
 
-def _check(results, own, shared):
-    """Rank 0 raised ``own[0]`` and rank 1 ``own[1]`` (exception type names); both
-    messages carry every pattern of ``shared``."""
+def _check(run, own, shared):
+    """The schedule ran as intended: rank 0 was alive and waiting for the marks when
+    rank 1 was let go. Then rank 0 raised ``own[0]`` and rank 1 ``own[1]`` (exception
+    type names), and both messages carry every pattern of ``shared``."""
+    results, saw = run
+    assert results[1]["released"] is True, results[1]  # rank 1 did stop, and was let go
     for result, kind in zip(results, own, strict=True):
         rank = result["rank"]
-        assert result["error"] == kind, f"rank {rank}: {result}"
+        assert result["error"] == kind, f"rank {rank}: {result}; the test saw: {saw}"
         for pattern in shared:
             assert re.search(pattern, result["message"]), \
                 f"rank {rank}: {pattern!r} not in:\n{result['message']}"
-        assert result["seconds"] < PROMPT, f"rank {rank} took {result['seconds']:.1f} s"
         assert result["gloo_groups"] == [] and result["gpubridge"] is False, result
-    assert results[1]["held"] is True  # the interleaving the test is about did happen
-    # Rank 0 was still there when rank 1 came to read: it stayed for at least the hold.
-    assert results[0]["seconds"] >= HELD * 0.9, f"rank 0 left after {results[0]['seconds']:.2f} s"
+    assert saw["rank 0"] == "waited for the marks" and saw["rank 0 alive at the release"], saw
+    assert saw["seconds"] < PROMPT, saw  # the watchdog
 
 
 def test_a_malformed_bridge_name_on_the_rank_that_hosts_the_store_reaches_the_other(tmp_path):
     case = {"api": "init", "vendors": ("nvidia", "amd"), "kwargs": [{"bridge": "typo"}, {}]}
-    results = _run(case, tmp_path)
-    _check(results, ("ValueError", "RuntimeError"), [r"unknown bridge transport 'typo'"])
-    assert "1 of 2 ranks reported problems.\n  rank 0: " in results[1]["message"]
+    run = _run(case, tmp_path)
+    _check(run, ("ValueError", "RuntimeError"), [r"unknown bridge transport 'typo'"])
+    assert "1 of 2 ranks reported problems.\n  rank 0: " in run[0][1]["message"]
 
 
 #: Two ranks of one vendor: in simulation one island of two ranks, a group of a C++
@@ -138,8 +184,8 @@ ONE_ISLAND = ("nvidia", "nvidia")
 
 @pytest.mark.parametrize("api", ["init", "backend"])
 def test_a_detail_refusal_reaches_both_ranks_when_rank_0_hosts_the_store(api, tmp_path):
-    results = _run({"api": api, "vendors": ONE_ISLAND, "detail": True}, tmp_path)
-    _check(results, ("RuntimeError", "RuntimeError"),
+    run = _run({"api": api, "vendors": ONE_ISLAND, "detail": True}, tmp_path)
+    _check(run, ("RuntimeError", "RuntimeError"),
            [r"torch's distributed debug level is DETAIL on ranks \[0, 1\] ",
             r"allow_debug_gloo=True", r"doesn't change the debug level itself"])
 
@@ -147,8 +193,8 @@ def test_a_detail_refusal_reaches_both_ranks_when_rank_0_hosts_the_store(api, tm
 def test_an_opt_in_mismatch_reaches_both_ranks_when_rank_0_hosts_the_store(tmp_path):
     case = {"api": "init", "vendors": ONE_ISLAND,
             "kwargs": [{"allow_debug_gloo": True}, {}]}
-    results = _run(case, tmp_path)
-    _check(results, ("RuntimeError", "RuntimeError"),
+    run = _run(case, tmp_path)
+    _check(run, ("RuntimeError", "RuntimeError"),
            [rf"Ranks disagree on {ALLOW_DEBUG_GLOO_ENV} \(allow_debug_gloo\): on for ranks "
             r"\[0\], off for ranks \[1\]"])
 
