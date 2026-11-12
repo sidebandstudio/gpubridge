@@ -650,8 +650,17 @@ def failure_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def discovery_deadline(timeout: timedelta | None) -> float:
+    """When discovery that starts now gives up (``time.monotonic()``): ``timeout`` from
+    now, 30 minutes if None. One deadline serves the whole of it: the wait for every
+    rank's record and, if the records refuse the job, rank 0's wait for the other ranks
+    to have read them (:func:`hold_for_readers`)."""
+    return time.monotonic() + (timeout or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
+
+
 def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | None,
-             timeout: timedelta | None, *, problem: str | None = None) -> tuple[PeerInfo, ...]:
+             timeout: timedelta | None, *, problem: str | None = None,
+             deadline: float | None = None) -> tuple[PeerInfo, ...]:
     """Exchange every rank's :class:`PeerInfo` through the c10d store.
 
     Collective over the job: every rank publishes its record under ``scope`` and reads
@@ -661,13 +670,16 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
 
     A rank that is about to raise because of the records (here, or after
     :func:`validate_peers` or :func:`check_plan`) first makes sure the others can read
-    them too: :func:`hold_for_readers`.
+    them too: :func:`hold_for_readers`, within the same ``deadline``
+    (:func:`discovery_deadline`; computed here from ``timeout`` if the caller, who
+    needs it again for that later hold, doesn't pass it).
 
     Raises:
         RuntimeError: if any rank published a problem, or a record of another version.
         TimeoutError: if a rank's record doesn't arrive in ``timeout`` (30 minutes if None).
     """
-    deadline = time.monotonic() + (timeout or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
+    if deadline is None:
+        deadline = discovery_deadline(timeout)
     record: dict[str, Any] = {"v": _rendezvous.RECORD_VERSION}
     if problem is None:
         assert local is not None
@@ -681,7 +693,7 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
                for r, rec in enumerate(records)
                if rec.get("error") or rec.get("v") != _rendezvous.RECORD_VERSION]
     if failing:
-        hold_for_readers(store, scope, rank, world_size, timeout)
+        hold_for_readers(store, scope, rank, world_size, deadline)
         raise RuntimeError(
             f"gpubridge cannot start: {len(failing)} of {world_size} ranks reported "
             "problems.\n" + "\n".join(f"  rank {r}: {p}" for r, p in failing))
@@ -689,20 +701,26 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
 
 
 def hold_for_readers(store, scope: str, rank: int, world_size: int,
-                     timeout: timedelta | None) -> None:
+                     deadline: float) -> None:
     """Before this rank raises because of what discovery found: if it may host the
-    job's store, stay until every other rank has read the discovery records, so each
-    of them raises the same reason and none a store error
-    (:func:`gpubridge.rendezvous.await_readers`).
+    job's store, stay until every other rank has read the discovery records, so that a
+    rank that is alive and can reach the store raises the reason too, not a store
+    error (:func:`gpubridge.rendezvous.await_readers`).
+
+    ``deadline`` is discovery's own (:func:`discovery_deadline`), not a new one: the
+    wait for the records and this hold share one budget, so a refused job has ended on
+    rank 0 by the time discovery alone would have timed out. That is a budget for
+    polling: each look at the store is a blocking call, and a store that stops
+    answering can keep one past the deadline.
 
     Only rank 0 waits: torch's rendezvous starts a TCP store's server there, and
-    nowhere else. Where a launcher's agent or a file holds the store the wait is over
-    as soon as the others have read, which they do at once. Called on the failing
-    path only: a job that starts never waits here. Never raises.
+    nowhere else. Where a launcher's agent or a file holds the store the wait is not
+    needed and is over as soon as the others have read, which they do at once (if one
+    of them never does, rank 0 still waits out the budget). Called on the failing path
+    only: a job that starts never waits here. Never raises.
     """
     if rank != 0:
         return
-    deadline = time.monotonic() + (timeout or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
     unread = _rendezvous.await_readers(store, f"gpubridge/{scope}/peer", rank, world_size,
                                        deadline)
     if unread:

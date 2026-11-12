@@ -134,8 +134,11 @@ links at once), never what a collective computes, and `auto` never picks them.
    or plain `env://` rendezvous the store's server lives in rank 0, and a
    rank 0 that left first would leave a slower rank with a network error
    instead of the reason. A rank that published its record and then vanished
-   holds rank 0 until the timeout, no longer. A job that starts pays one more
-   store write per rank and waits for no mark.
+   holds rank 0 until discovery's own deadline (the one `timeout` counted from
+   when discovery began, not a second one). That deadline is a budget for
+   polling: each look at the store is a blocking call, and a store that stops
+   answering can hold one past it. A job that starts pays one more store write
+   per rank and waits for no mark.
 4. The default process group is created: gpubridge's own (a
    `GpubridgeProcessGroup`, as under `backend="gpubridge"`), so
    `torch.distributed` calls on it run through gpubridge. Only `bridge="gloo"`

@@ -29,6 +29,7 @@ outlives its ranks.
 
 from __future__ import annotations
 
+import itertools
 import json
 import multiprocessing
 import multiprocessing.connection
@@ -36,7 +37,9 @@ import os
 import random
 import re
 import socket
+import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -232,5 +235,64 @@ def test_the_marks_cost_a_starting_job_one_set_and_no_wait(tmp_path):
     assert gpubridge.rendezvous.await_readers(store, "p", 0, 3, time.monotonic() + 5) == []
     # Only rank 0 holds: any other rank returns at once, whatever is missing.
     began = time.monotonic()
-    gpubridge.topology.hold_for_readers(store, "nobody-read-this", 1, 3, TIMEOUT)
+    gpubridge.topology.hold_for_readers(store, "nobody-read-this", 1, 3, began + 60)
     assert time.monotonic() - began < 0.5
+
+
+#: The discovery timeout of the two checks below, and when in it the other rank's
+#: record arrives: most of the budget is gone by then.
+BUDGET, LATE = 2.0, 0.7
+
+
+def _write_late(path, key, value):
+    """Another rank's record, written from a thread through its own handle on the
+    file store once most of the budget is spent. That rank never reads, so never marks."""
+    def write():
+        time.sleep(LATE * BUDGET)
+        dist.FileStore(path, 2).set(key, value)
+    thread = threading.Thread(target=write, daemon=True)
+    thread.start()
+    return thread
+
+
+def _within_one_budget(began):
+    took = time.monotonic() - began
+    # Rank 0 did hold for a rank that never marked, to the end of the budget...
+    assert took >= 0.9 * BUDGET, f"gave up after {took:.2f} s of a {BUDGET} s budget"
+    # ...and not for a second budget counted from the moment the record arrived
+    # (which would end at (LATE + 1) * BUDGET).
+    assert took < (LATE + 0.7) * BUDGET, f"held {took:.2f} s: more than one {BUDGET} s budget"
+
+
+def test_discovers_hold_ends_at_discoverys_own_deadline(tmp_path, monkeypatch):
+    monkeypatch.setenv(VENDOR_ENV, "nvidia")
+    path = str(tmp_path / "store")
+    local, _ = gpubridge.topology.describe_local("tcp")
+    record = json.dumps({"v": gpubridge.rendezvous.RECORD_VERSION, "error": "bad setting"})
+    began = time.monotonic()
+    writer = _write_late(path, "gpubridge/late/peer/1", record)
+    with pytest.raises(RuntimeError, match="1 of 2 ranks reported problems.\n  rank 1: bad"):
+        gpubridge.topology.discover(dist.FileStore(path, 2), "late", 0, 2, local,
+                                    timedelta(seconds=BUDGET))
+    _within_one_budget(began)
+    writer.join()
+
+
+def test_inits_hold_after_validation_ends_at_discoverys_own_deadline(tmp_path, monkeypatch):
+    # The same through gpubridge.init(), where the refusal comes after discovery, from
+    # validate_peers: the other rank reports a valid bridge that isn't this rank's.
+    monkeypatch.setenv(VENDOR_ENV, "nvidia")
+    monkeypatch.delenv(ALLOW_DEBUG_GLOO_ENV, raising=False)
+    monkeypatch.setattr(gpubridge.torch_backend, "_world_setups", itertools.count(1000))
+    path = str(tmp_path / "store")
+    other, _ = gpubridge.topology.describe_local("ucx")
+    record = json.dumps({"v": gpubridge.rendezvous.RECORD_VERSION, "peer": other.to_wire()})
+    began = time.monotonic()
+    writer = _write_late(path, "gpubridge/world1000/peer/1", record)
+    with pytest.raises(RuntimeError, match=r"Ranks picked different bridge transports: 'tcp' "
+                                           r"on ranks \[0\]; 'ucx' on ranks \[1\]"):
+        gpubridge.init(init_method=f"file://{path}", rank=0, world_size=2,
+                       timeout=timedelta(seconds=BUDGET), bridge="tcp")
+    _within_one_budget(began)
+    writer.join()
+    assert not gpubridge.is_initialized() and not dist.is_initialized()

@@ -146,8 +146,10 @@ def await_readers(store, prefix: str, rank: int, size: int, deadline: float) -> 
     markers are in, rank 0 may go.
 
     Never raises: the caller is about to raise the real reason. A rank that vanished
-    between its record and its marker holds this rank until ``deadline``, the wait the
-    exchange itself had, and no longer.
+    between its record and its marker holds this rank until ``deadline``, which the
+    caller passes on from the exchange (the same one, not a second timeout), and no
+    longer. ``deadline`` bounds the polling, not each call: a look at the store is a
+    blocking request, and one that the store never answers can outlast it.
     """
     keys = [f"{prefix}/read/{r}" for r in range(size) if r != rank]
     pause = WAIT_POLL_FIRST

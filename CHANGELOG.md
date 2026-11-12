@@ -308,9 +308,12 @@ unless it asks for one.** Read this before upgrading a job.
   store's server lives in rank 0; without this a slower rank could get a
   network error from a store that had gone, not the reason
   (`tests/test_store_owner.py` holds a rank between its write and its reads
-  to show it). A rank that published and then vanished holds rank 0 until the
-  discovery timeout, no longer; a rank that never published is named at the
-  timeout on every rank, as before. A job that starts pays one more store
+  to show it). A rank that published and then vanished holds rank 0 until
+  discovery's own deadline, the one the wait for the records had, not a second
+  timeout after it; a rank that never published is named at the timeout on
+  every rank, as before. The deadline is a budget for polling: each look at
+  the store is a blocking call, and a store that stops answering can hold one
+  past it. A job that starts pays one more store
   write per rank and waits for no mark. Not covered: failures after discovery
   (a bridge that cannot connect is published through the bridge's own status
   keys, as before).

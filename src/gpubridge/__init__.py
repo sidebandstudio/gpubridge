@@ -221,7 +221,9 @@ def init(
     # any process group exists, so what every rank reports decides the groups.
     store, rank, world_size = _rendezvous.open_store(init_method, rank, world_size, timeout)
     scope = f"world{next(_torch_backend._world_setups)}"
-    peers = _topology.discover(store, scope, rank, world_size, local, timeout)
+    deadline = _topology.discovery_deadline(timeout)
+    peers = _topology.discover(store, scope, rank, world_size, local, timeout,
+                               deadline=deadline)
     try:
         # Everything the ranks' reports alone can refuse, before any group exists: no
         # store call lies between a rank's reading the reports and its raising here.
@@ -229,7 +231,8 @@ def init(
         _topology.check_plan(peers, config, chosen, transport)
     except RuntimeError:
         # If this rank hosts the store, the others must have read the reports first.
-        _topology.hold_for_readers(store, scope, rank, world_size, timeout)
+        # Within discovery's own deadline, not a new one.
+        _topology.hold_for_readers(store, scope, rank, world_size, deadline)
         raise
 
     kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
