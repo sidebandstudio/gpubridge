@@ -183,7 +183,9 @@ def _rank(rank, vendors, init_file, setups, api, expect, check, labels=None):
                                       world_size=len(vendors), timeout=TIMEOUT,
                                       **{"bridge": "tcp", **setup.get("kwargs", {})})
         else:
-            os.environ.setdefault(BRIDGE_ENV, "tcp")
+            # Named, not left to the environment: the suite also runs with
+            # GPUBRIDGE_BRIDGE=gloo, and a job on the Gloo bridge is never refused.
+            os.environ[BRIDGE_ENV] = "tcp"
             dist.init_process_group("gpubridge", init_method=f"file://{init_file}", rank=rank,
                                     world_size=len(vendors), timeout=TIMEOUT)
             dist.barrier()  # the backend sets itself up at its first collective
