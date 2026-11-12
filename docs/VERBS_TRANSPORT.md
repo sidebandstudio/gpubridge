@@ -762,7 +762,8 @@ references, not tensor bytes; users must budget outstanding tensor memory too.
 passes `gpubridge.verbs.availability()` (the library loads or builds, an
 endpoint opens on this process's `GPUBRIDGE_VERBS_*` settings: a device, an
 active port, an address; the MOCK test fabric never counts) and all leaders are
-on one link layer. Otherwise `auto` is the TCP bridge. A job on verbs creates no Gloo group (torch would add Gloo helper groups to the
+on one link layer. Otherwise `auto` is the TCP bridge. A job on verbs that doesn't ask for Gloo another way (the `flat-gloo` policy)
+creates no Gloo group (torch would add Gloo helper groups to the
 islands at its debug level DETAIL, so `init()` refuses that level unless the job
 sets `allow_debug_gloo` / `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`: RUNTIME_INVENTORY.md,
 section 6). `device_tensors` is True: GPU

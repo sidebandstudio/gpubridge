@@ -203,9 +203,14 @@ that doesn't ask for it, and a Rust bridge is the default.
   whose island groups are all Python groups (one-rank simulated islands) is not
   refused: torch wraps none of them.
 
-So: a GPU job on `auto`, `tcp`, `verbs` or `ucx` that starts without `allow_debug_gloo`
-has no Gloo group and no thread named `pt_gloo_runloop` or `gloo_tcp_loop` when
-`init()` returns. Two limits of that sentence:
+So a GPU job has no Gloo group and no thread named `pt_gloo_runloop` or `gloo_tcp_loop`
+when `init()` returns if it did not ask for Gloo in any of the ways above (its bridge is
+`auto`, `tcp`, `verbs` or `ucx` and not `gloo` or a `GlooTransport` subclass, and its
+policy is not `flat-gloo`, by name or as an `auto-tuned` rule) and did not accept
+torch's debug helpers with `allow_debug_gloo`. Both conditions are needed: a job on
+`bridge="tcp"` with `policy="flat-gloo"` has a Gloo group because of its policy, though
+the Rust bridge under it still has no Gloo thread of its own.
+Two limits of that sentence:
 
 - **A debug level raised after `init()` is outside the guard.** The islands exist by
   then and are not wrapped. A subgroup set up later (HSDP, a DeviceMesh dimension)

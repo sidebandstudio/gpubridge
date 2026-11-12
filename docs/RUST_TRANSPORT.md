@@ -15,7 +15,8 @@ The Gloo bridge is opt-in (`bridge="gloo"`), and stays the reference in tests.
 Not for speed. On Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can
 abort a process at interpreter exit, after training has finished
 ([RUNTIME_INVENTORY.md](RUNTIME_INVENTORY.md#6-the-gloo-decisions-reversed-2026-11-11)).
-A job on this bridge creates no Gloo group: the bridge is not a process group,
+The bridge itself creates no Gloo group and has no Gloo thread, and a job on it that
+doesn't ask for Gloo some other way (the `flat-gloo` policy) has none: the bridge is not a process group,
 its rendezvous is the c10d store, and its threads never touch a Python object
 (["Threading"](#design)). (torch would add Gloo helper groups to the islands at
 its debug level DETAIL; `init()` refuses that unless the job opts in with

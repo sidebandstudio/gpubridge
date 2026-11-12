@@ -26,25 +26,53 @@ def _text(path: Path) -> str:
     return " ".join(path.read_text().split())  # one line: sentences wrap anywhere
 
 
-def test_no_doc_states_the_no_gloo_guarantee_without_its_qualification():
+#: The no-Gloo guarantee, in the words the docs use for it.
+STATED = re.compile(r"creates no Gloo (process )?group|no Gloo group and no Gloo thread|"
+                    r"has no Gloo (process )?group|Gloo is no longer created unless asked")
+#: Its first condition: the job did not ask for Gloo.
+ASKED = re.compile(r"ask(s|ed)? for (Gloo|one)|unless asked|n't ask for Gloo|not ask for Gloo")
+#: Its second: it did not accept torch's debug helpers.
+DEBUG = re.compile(r"DETAIL|allow_debug_gloo|" + ALLOW_DEBUG_GLOO_ENV)
+
+
+def _paragraphs(path: Path) -> list[str]:
+    """The file's paragraphs (blocks between blank lines), each as one line."""
+    return [" ".join(block.split()) for block in re.split(r"\n\s*\n", path.read_text())]
+
+
+def test_the_no_gloo_guarantee_is_stated_with_both_of_its_conditions():
     # The sentence a review found: unconditional, two lines under the paragraph that
     # described the exception to it.
     for path in DOCS:
         assert "therefore creates no Gloo group" not in _text(path), path.name
-    # Wherever the guarantee is stated in so many words, the opt-in or the debug level
-    # is named in the same file.
-    stated = re.compile(r"creates no Gloo (process )?group|no Gloo group and no Gloo thread|"
-                        r"has no Gloo process group|Gloo is no longer created unless asked")
+    # Wherever the guarantee is stated, the paragraph that states it carries both
+    # conditions: the job didn't ask for Gloo, and didn't accept torch's debug
+    # helpers. Not merely somewhere in the file.
+    found = 0
     for path in DOCS:
-        text = _text(path)
-        if stated.search(text):
-            assert "DETAIL" in text and ("allow_debug_gloo" in text
-                                         or ALLOW_DEBUG_GLOO_ENV in text), path.name
+        for paragraph in _paragraphs(path):
+            if STATED.search(paragraph):
+                found += 1
+                assert ASKED.search(paragraph), f"{path.name}: no 'asked for Gloo' in: {paragraph}"
+                assert DEBUG.search(paragraph), f"{path.name}: no debug level in: {paragraph}"
+    assert found >= 6  # README, CHANGELOG, the inventory, the bridges' docs, item 44
+    # The inventory's summary sentence itself, the one a reader quotes: both conditions
+    # inside the sentence, the policy by name.
     inventory = _text(ROOT / "docs" / "RUNTIME_INVENTORY.md")
+    start = inventory.index("So a GPU job has no Gloo group")
+    sentence = inventory[start:inventory.index(". ", start)]
+    for phrase in ("did not ask for Gloo", "`flat-gloo`", "`GlooTransport` subclass",
+                   "did not accept torch's debug helpers with `allow_debug_gloo`"):
+        assert phrase in sentence, (phrase, sentence)
     for phrase in ("allow_debug_gloo=True", ALLOW_DEBUG_GLOO_ENV, "raised after `init()` is "
                    "outside the guard", "No GPU run has shown"):
         assert phrase in inventory, phrase
     assert ALLOW_DEBUG_GLOO_ENV in (gpubridge.init.__doc__ or "")
+    # The module that does discovery says what it does (no group at all), and leaves
+    # the guarantee and its exceptions to the inventory.
+    intro = " ".join((gpubridge.rendezvous.__doc__ or "").split())
+    assert "Nothing here creates a process group" in intro
+    assert not STATED.search(intro), intro
 
 
 def test_the_parity_claim_names_how_often_the_ring_order_differs_from_gloo():
