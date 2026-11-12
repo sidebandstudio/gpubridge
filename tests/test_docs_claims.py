@@ -67,12 +67,53 @@ def test_the_no_gloo_guarantee_is_stated_with_both_of_its_conditions():
     for phrase in ("allow_debug_gloo=True", ALLOW_DEBUG_GLOO_ENV, "raised after `init()` is "
                    "outside the guard", "No GPU run has shown"):
         assert phrase in inventory, phrase
-    assert ALLOW_DEBUG_GLOO_ENV in (gpubridge.init.__doc__ or "")
+    # The API's own statement of it, read alone: gpubridge.init()'s docstring. The
+    # paragraph that states the guarantee names every way of asking for Gloo and the
+    # debug opt-in.
+    stated = [" ".join(block.split()) for block in re.split(r"\n\s*\n", gpubridge.init.__doc__)
+              if re.search(r"has no Gloo group|creates no Gloo group", " ".join(block.split()))]
+    assert len(stated) == 1, stated
+    for phrase in ("unless it asks for Gloo or accepts torch's own debug helpers",
+                   '``bridge="gloo"``', "``GlooTransport`` subclass", "``flat-gloo`` policy",
+                   "``auto-tuned`` rule", "CPU simulation", "island of several ranks",
+                   "``allow_debug_gloo``", "DETAIL"):
+        assert phrase in stated[0], phrase
+    assert ALLOW_DEBUG_GLOO_ENV in gpubridge.init.__doc__
+    # No sentence of it claims Gloo is never created without those conditions.
+    assert "creates no Gloo group for the job" not in " ".join(gpubridge.init.__doc__.split())
     # The module that does discovery says what it does (no group at all), and leaves
     # the guarantee and its exceptions to the inventory.
     intro = " ".join((gpubridge.rendezvous.__doc__ or "").split())
     assert "Nothing here creates a process group" in intro
     assert not STATED.search(intro), intro
+
+
+def test_the_shared_refusal_is_stated_with_what_it_covers_and_rests_on():
+    # "Every rank raises the same reason" holds for the refusals decided from the
+    # discovery records, for ranks that are alive and can reach the store, on discovery
+    # keys no earlier job wrote. Wherever it is promised, that is said beside it.
+    doc = " ".join(gpubridge.init.__doc__.split())
+    readme, changelog = _text(ROOT / "README.md"), _text(ROOT / "CHANGELOG.md")
+    for where, text in (("init()", doc), ("README", readme), ("CHANGELOG", changelog)):
+        for pattern in (r"alive and can reach the store",
+                        r"no earlier job wrote",
+                        r"fresh store",
+                        r"persistent store under a prefix an earlier job used is not supported",
+                        r"ValueError",                   # the malformed rank's own type
+                        r"bridge that cannot connect"):  # later failures: not covered
+            assert re.search(pattern, text), f"{where}: {pattern}"
+    # The wait is a polling budget on discovery's own deadline, not a second timeout
+    # and not a bound on a store call.
+    for where, text in (("README", readme), ("CHANGELOG", changelog)):
+        assert "budget for polling" in text and "blocking call" in text, where
+    hold = " ".join((gpubridge.topology.hold_for_readers.__doc__ or "").split())
+    assert "not a new one" in hold and "budget for polling" in hold
+    readers = " ".join((gpubridge.rendezvous.await_readers.__doc__ or "").split())
+    for phrase in ("no generation", "such reuse is not supported", "bounds the polling, not "
+                   "each call"):
+        assert phrase in readers, phrase
+    # Nothing promises more: no "none a store error" without those conditions.
+    assert "none a store error" not in hold
 
 
 def test_the_parity_claim_names_how_often_the_ring_order_differs_from_gloo():

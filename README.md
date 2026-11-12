@@ -138,7 +138,14 @@ links at once), never what a collective computes, and `auto` never picks them.
    when discovery began, not a second one). That deadline is a budget for
    polling: each look at the store is a blocking call, and a store that stops
    answering can hold one past it. A job that starts pays one more store write
-   per rank and waits for no mark.
+   per rank and waits for no mark. What this covers: the refusals decided from
+   the discovery records, which every rank that is alive and can reach the
+   store raises as the same `RuntimeError` (a rank whose own name or setting is
+   malformed raises its own `ValueError`, the others its message). Not failures
+   later in `init()`, such as a bridge that cannot connect. And it needs
+   discovery keys no earlier job wrote: a fresh store per job, or a namespace
+   per job or attempt, as a launcher gives. Starting a new job on a persistent
+   store under a prefix an earlier job used is not supported.
 4. The default process group is created: gpubridge's own (a
    `GpubridgeProcessGroup`, as under `backend="gpubridge"`), so
    `torch.distributed` calls on it run through gpubridge. Only `bridge="gloo"`

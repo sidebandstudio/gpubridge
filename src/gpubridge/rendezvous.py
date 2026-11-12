@@ -145,6 +145,12 @@ def await_readers(store, prefix: str, rank: int, size: int, deadline: float) -> 
     its marker has every record and reads the store no more to decide, so once all
     markers are in, rank 0 may go.
 
+    What this rests on: ranks that are alive, a store that answers, and markers that
+    this job's ranks wrote. A marker is a plain key with no generation in it, so on a
+    persistent store that an earlier job used under the same prefix, that job's
+    markers (like its records) would be taken for this one's: such reuse is not
+    supported, and a job needs a fresh store or a namespace of its own.
+
     Never raises: the caller is about to raise the real reason. A rank that vanished
     between its record and its marker holds this rank until ``deadline``, which the
     caller passes on from the exchange (the same one, not a second timeout), and no

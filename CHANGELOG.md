@@ -296,7 +296,8 @@ unless it asks for one.** Read this before upgrading a job.
   Gloo islands standing in for NCCL ones (`tests/test_debug_gloo.py`); that
   torch wraps an NCCL group the same way is read from torch 2.8.0 and 2.15.0,
   not run on a GPU.
-- **A refusal found in discovery reaches every rank.** A rank that cannot
+- **A refusal found in discovery reaches every rank that is alive and can
+  reach the store.** A rank that cannot
   resolve its own settings (an unknown bridge or policy name, a bridge module
   that fails to import, an invalid `GPUBRIDGE_*` value) publishes the error as
   its discovery record before it raises, so the others raise with its message
@@ -313,7 +314,14 @@ unless it asks for one.** Read this before upgrading a job.
   timeout after it; a rank that never published is named at the timeout on
   every rank, as before. The deadline is a budget for polling: each look at
   the store is a blocking call, and a store that stops answering can hold one
-  past it. A job that starts pays one more store
+  past it. This holds for ranks that are alive and can reach the store, and
+  for discovery keys no earlier job wrote (a fresh store per job, or a
+  namespace per job or attempt): starting a new job on a persistent store
+  under a prefix an earlier job used is not supported, as that job's records
+  and read marks would be taken for the new one's. The rank with the malformed
+  setting keeps its own exception type (`ValueError`); "the same message"
+  means the `RuntimeError` text of the refusals decided from the discovery
+  records. A job that starts pays one more store
   write per rank and waits for no mark. Not covered: failures after discovery
   (a bridge that cannot connect is published through the bridge's own status
   keys, as before).
