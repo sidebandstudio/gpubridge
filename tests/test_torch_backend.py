@@ -318,7 +318,10 @@ def _cpu_tensor_path(rank, world):
     assert seen == ["barrier"], seen  # the rest on the backend's Gloo group, not gpubridge
 
 
-def test_the_cpu_tensor_path_carries_every_collective_on_gloo(tmp_path):
+def test_the_cpu_tensor_path_carries_every_collective_on_gloo(tmp_path, monkeypatch):
+    # bridge="gloo": the one bridge whose backend has a Gloo group for CPU tensors. (On
+    # any other they go through the topology: tests/test_no_gloo.py.)
+    monkeypatch.setenv(BRIDGE_ENV, "gloo")
     run_backend(TWO_TWO, _cpu_tensor_path, tmp_path)
 
 
@@ -489,6 +492,70 @@ def test_a_setting_that_differs_fails_the_first_collective_on_every_rank(tmp_pat
                 env={0: {POLICY_ENV: "flat-gloo"}, -1: {}})
 
 
+@gpubridge.register_policy
+class Failing(gpubridge.policies.ReduceBridgeBroadcast):
+    """A policy whose all_reduce fails on every rank, as a lost bridge peer would."""
+
+    name = "test-failing"
+
+    def all_reduce(self, tensor, topology, op=None):
+        raise ZeroDivisionError("policy bug")
+
+
+def _a_failed_collective_raises(rank, world):
+    dist.barrier()
+    t = torch.ones(3)
+    # The call that failed raises, not only the one after it: torch's own Work for a
+    # Python backend would return from wait() as if the collective had worked.
+    with pytest.raises(RuntimeError, match="all_reduce failed: policy bug"):
+        dist.all_reduce(t)
+    # And every later collective on this rank refuses to start, sync or async, whatever
+    # torch function asks.
+    refused = "an earlier async gpubridge collective failed"
+    with pytest.raises(RuntimeError, match=refused):
+        dist.all_reduce(t)
+    with pytest.raises(RuntimeError, match=refused):
+        dist.all_gather([torch.zeros(1) for _ in range(world)], torch.ones(1))
+    with pytest.raises(RuntimeError, match=refused):
+        dist.broadcast(t, src=0, async_op=True)
+    with pytest.raises(RuntimeError, match=refused):
+        dist.barrier()
+
+
+def test_a_failed_collective_raises_from_the_torch_call_that_made_it(tmp_path):
+    run_backend(TWO_TWO, _a_failed_collective_raises, tmp_path,
+                env={-1: {POLICY_ENV: "test-failing"}})
+
+
+def _an_async_failure_raises_from_wait(rank, world):
+    dist.barrier()
+    work = dist.all_reduce(torch.ones(3), async_op=True)
+    with pytest.raises(RuntimeError, match="all_reduce failed: policy bug"):
+        work.wait()
+    assert work.is_completed() and not work.is_success()
+    assert isinstance(work.exception(), ZeroDivisionError)
+
+
+def test_an_async_collectives_failure_raises_from_its_wait(tmp_path):
+    run_backend(TWO_TWO, _an_async_failure_raises_from_wait, tmp_path,
+                env={-1: {POLICY_ENV: "test-failing"}})
+
+
+def _ddp_without_a_hook_fails_by_the_next_collective(rank, world):
+    # DDP's reducer is C++: it gets the kind of Work C++ can hold, whose wait() doesn't
+    # raise. The failure then stops the job at this rank's next collective at the
+    # latest, never later.
+    model = nn.parallel.DistributedDataParallel(_integer_model())
+    with pytest.raises(RuntimeError, match="policy bug|an earlier async gpubridge collective"):
+        model(_batch(rank, 0)).sum().backward()
+        dist.barrier()
+
+
+def test_ddp_without_a_comm_hook_fails_by_the_collective_after_a_failed_one(tmp_path):
+    run_backend(TWO_TWO, _ddp_without_a_hook_fails_by_the_next_collective, tmp_path,
+                env={-1: {POLICY_ENV: "test-failing"}})
+
+
 def _two_jobs_in_a_row(rank, world):
     t = rank_tensor((3,), torch.float32, rank)
     dist.all_reduce(t)
@@ -506,10 +573,44 @@ def _backend_group_after_init(topology):
         dist.all_reduce(torch.ones(2), group=group)
 
 
-def test_a_backend_group_after_gpubridge_init_is_refused(tmp_path):
+def test_a_backend_group_after_gpubridge_init_on_gloo_is_refused(tmp_path):
+    # After init(bridge="gloo") the default group is a Gloo one, and a group of this
+    # backend beside it would be a second gpubridge in the process.
     from _harness import run_ranks
 
-    run_ranks(TWO_TWO, _backend_group_after_init, tmp_path)
+    run_ranks(TWO_TWO, _backend_group_after_init, tmp_path, init_kwargs={"bridge": "gloo"})
+
+
+def _backend_groups_after_init(topology):
+    # On any other bridge the default group is this backend's already: a group of every
+    # rank runs on init()'s topology, and a subgroup builds its own, as under
+    # init_process_group(backend="gpubridge").
+    assert isinstance(dist.distributed_c10d._get_default_group(),
+                      torch_backend.GpubridgeProcessGroup)
+    rank, world = topology.rank, topology.world_size
+    everyone = dist.new_group(list(range(world)), backend="gpubridge")
+    t = rank_tensor((3,), torch.float32, rank)
+    dist.all_reduce(t, group=everyone)
+    assert torch.equal(t, expected_sum((3,), torch.float32, world))
+    assert gpubridge.get_topology() is topology
+    pair = dist.new_group([0, 2])  # one rank of each vendor, on the default backend
+    if rank in (0, 2):
+        t = rank_tensor((3,), torch.float32, rank)
+        dist.all_reduce(t, group=pair)
+        assert torch.equal(t, rank_tensor((3,), torch.float32, 0) + rank_tensor(
+            (3,), torch.float32, 2))
+        assert _sub(pair)._topology().layout.members == (0, 2)
+    dist.barrier()
+    t = rank_tensor((2,), torch.float32, rank)
+    gpubridge.all_reduce(t)
+    assert torch.equal(t, expected_sum((2,), torch.float32, world))
+
+
+def test_backend_groups_after_gpubridge_init_run_on_its_topology(tmp_path, monkeypatch):
+    from _harness import run_ranks
+
+    monkeypatch.delenv(BRIDGE_ENV, raising=False)
+    run_ranks(TWO_TWO, _backend_groups_after_init, tmp_path)
 
 
 def test_bridge_from_gpubridge_bridge_is_checked(tmp_path):
@@ -686,14 +787,16 @@ def _hsdp(rank, world, out):
     records = _Records()
     gpubridge.add_observer(records)
     bridge_calls = []
+    active = gpubridge.get_topology().transport  # the bridge the job runs on
+    assert issubclass(active, transport.BridgeTransport)
     for name in ("all_reduce", "broadcast"):
-        plain = getattr(transport.GlooTransport, name)
+        plain = getattr(active, name)
 
         def counted(self, *args, _plain=plain, _name=name, **kwargs):
             bridge_calls.append(_name)
             return _plain(self, *args, **kwargs)
 
-        setattr(transport.GlooTransport, name, counted)
+        setattr(active, name, counted)
     mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("replicate", "shard"))
     shard, replicate = mesh.get_group("shard"), mesh.get_group("replicate")
     assert _sub(shard)._topology().layout.members == ((0, 1) if rank < 2 else (2, 3))
@@ -806,8 +909,8 @@ def test_world_setups_use_fresh_transport_store_names():
     from gpubridge.transport import scoped_name
 
     names = []
-    for _ in range(2):
-        with torch_backend._world_group_names():
+    for _ in range(2):  # as setup() and gpubridge.init() name each world setup
+        with topology.setup_names(f"gpubridge:world{next(torch_backend._world_setups)}"):
             names.append(scoped_name([0, 1]))
     assert all(names) and names[0] != names[1]
     assert scoped_name([0, 1]) is None
@@ -1007,6 +1110,8 @@ def _gpu_ddp(rank, world):
         g = p.grad.clone()
         dist.all_reduce(g, op=dist.ReduceOp.MAX)
         assert torch.equal(g, p.grad)  # identical on every rank
-    flags = torch.ones(1)  # a CPU tensor on a GPU job: Gloo carries it
+    # A CPU tensor on a GPU job: staged through this rank's GPU and carried by the
+    # topology (by a Gloo group of the backend's own with GPUBRIDGE_BRIDGE=gloo).
+    flags = torch.ones(1)
     dist.all_reduce(flags)
     assert flags.item() == world

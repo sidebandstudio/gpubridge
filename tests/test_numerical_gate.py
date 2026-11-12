@@ -27,8 +27,12 @@ def _check(topology):
                 assert all(x["actual"] != x["expected"] for x in negative["inputs"])
 
 
+#: The gate's software arm is the Gloo bridge, by name: it checks the job ran on it.
+GLOO = {"bridge": "gloo"}
+
+
 def test_independent_updates_and_reduced_negative_controls(tmp_path):
-    run_ranks(["nvidia", "nvidia", "amd", "amd"], _check, tmp_path)
+    run_ranks(["nvidia", "nvidia", "amd", "amd"], _check, tmp_path, init_kwargs=GLOO)
 
 
 def _save(topology, directory):
@@ -40,7 +44,8 @@ def _save(topology, directory):
 def test_comparison_requires_complete_matching_provenance_and_numeric_values(tmp_path):
     from functools import partial
 
-    run_ranks(["nvidia", "nvidia", "amd", "amd"], partial(_save, directory=str(tmp_path)), tmp_path)
+    run_ranks(["nvidia", "nvidia", "amd", "amd"], partial(_save, directory=str(tmp_path)), tmp_path,
+              init_kwargs=GLOO)
     # Copies test the report comparator only; these are not three independent arms.
     base = [json.loads((tmp_path / f"rank{r}.json").read_text()) for r in range(4)]
     records = []

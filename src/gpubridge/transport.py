@@ -2,14 +2,25 @@
 
 By default the bridge moves CPU tensors between island leaders, so anything
 that can sum and broadcast a CPU tensor among a fixed set of processes can
-carry it (a transport with ``device_tensors`` also takes GPU tensors). Gloo is
-the default; ``bridge="ucx"`` (:mod:`gpubridge.ucx.transport`),
-``bridge="multitcp"`` (:mod:`gpubridge.multitcp.transport`) and ``bridge="verbs"``
-(:mod:`gpubridge.verbs.transport`) are the other built-in ones, each imported
-the first time its name is asked for, so a job on the default bridge never loads
-them. Another transport (MPI, an RDMA path) plugs in by subclassing
-:class:`BridgeTransport` and registering it, without touching the
-reduce-bridge-broadcast logic in ``collectives.py``.
+carry it (a transport with ``device_tensors`` also takes GPU tensors).
+
+The default is ``bridge="auto"``, which ``init()`` resolves once, the same on
+every rank, to one of gpubridge's two Rust bridges: ``"verbs"``
+(:mod:`gpubridge.verbs.transport`, RDMA) when every island leader passes that
+bridge's own check for a usable RDMA device (:func:`gpubridge.verbs.availability`)
+and they are on one link layer, otherwise ``"tcp"``
+(:mod:`gpubridge.multitcp.transport`; ``"multitcp"`` is its older name).
+:func:`choose_bridge` is the rule. It is never Gloo, and a job never changes
+bridge once ``init()`` has returned.
+
+``bridge="gloo"`` (a Gloo process group of the leaders, the default through 0.4.0-alpha)
+stays for one release, opt-in: asking for it is the only way a job gets its
+bridge, its default group and its barriers on Gloo. ``bridge="ucx"``
+(:mod:`gpubridge.ucx.transport`) is the other built-in one. Each built-in
+bridge's module is imported the first time its name is asked for, so a job
+loads only the one it runs on. Another transport (MPI, another RDMA path)
+plugs in by subclassing :class:`BridgeTransport` and registering it, without
+touching the reduce-bridge-broadcast logic in ``collectives.py``.
 """
 
 from __future__ import annotations
@@ -121,11 +132,17 @@ class BridgeTransport(abc.ABC):
         Gloo group contains every member, including non-leaders. The default
         refuses P2P without changing existing collective-only transports.
         """
-        raise NotImplementedError(f"bridge transport {cls.name!r} has no point-to-point link")
+        raise NotImplementedError(
+            f"bridge transport {cls.name!r} has no point-to-point link: point-to-point "
+            "across islands (and of CPU tensors on a GPU job) needs bridge=\"tcp\", "
+            "\"ucx\" or \"gloo\" (GPUBRIDGE_BRIDGE under the torch.distributed backend)")
 
 
 class GlooTransport(BridgeTransport):
-    """The default bridge: a Gloo process group of the island leaders."""
+    """``bridge="gloo"``: a Gloo process group of the island leaders. Opt-in: the
+    default through 0.4.0-alpha, kept for one release as the reference the other bridges are
+    tested against. A job on it (or on a subclass) is the only kind whose default
+    group, discovery barrier and bridge are Gloo groups."""
 
     name = "gloo"
     reduce_ops = frozenset({"sum", "max", "min"})
@@ -153,16 +170,50 @@ class GlooTransport(BridgeTransport):
         return GlooLink(group)
 
 
-DEFAULT_TRANSPORT = GlooTransport.name
+#: ``bridge="auto"``: let ``init()`` choose between the Rust bridges (:func:`choose_bridge`).
+AUTO = "auto"
+DEFAULT_TRANSPORT = AUTO
+#: What ``auto`` falls to without RDMA on every leader, and what it prefers with it.
+TCP, VERBS = "tcp", "verbs"
 
 _TRANSPORTS: dict[str, type[BridgeTransport]] = {GlooTransport.name: GlooTransport}
 
-#: The opt-in transports gpubridge ships, by name, and the module whose import registers
+#: The other transports gpubridge ships, by name, and the module whose import registers
 #: each. A name's module is imported at its first use (resolve_transport,
 #: register_transport): ``import gpubridge`` doesn't load them, and a job loads only the
-#: one it names (verbs still imports shared helpers from ucx.transport).
-_BUILT_IN = {"ucx": "gpubridge.ucx.transport", "multitcp": "gpubridge.multitcp.transport",
-             "verbs": "gpubridge.verbs.transport"}
+#: one it runs on (verbs still imports the GPU flush helpers from ucx.gdr).
+_BUILT_IN = {"ucx": "gpubridge.ucx.transport", TCP: "gpubridge.multitcp.transport",
+             VERBS: "gpubridge.verbs.transport"}
+#: Older names of built-in transports: ``bridge="multitcp"`` is ``bridge="tcp"``.
+_ALIASES = {"multitcp": TCP}
+
+
+def choose_bridge(leaders: Sequence[int], reports: dict[int, dict]) -> tuple[str, str]:
+    """What ``bridge="auto"`` resolves to, and why: a pure function of what every
+    island leader reported, so every rank that reads the same reports chooses the same.
+
+    ``"verbs"`` when every leader's report (:func:`gpubridge.verbs.availability`) says
+    its RDMA device passed the verbs bridge's own check and all of them are on one link
+    layer (an InfiniBand port and a RoCE port can't connect); otherwise ``"tcp"``.
+
+    Args:
+        leaders: The island leaders' global ranks.
+        reports: Each leader's availability report, by rank.
+
+    Returns:
+        ``(name, reason)``.
+    """
+    missing = [(rank, str(reports[rank].get("reason") or "no reason given"))
+               for rank in leaders if not reports[rank].get("ok")]
+    if missing:
+        detail = "; ".join(f"rank {rank}: {why}" for rank, why in missing)
+        return TCP, f"verbs isn't available on every island leader ({detail})"
+    layers = sorted({str(reports[rank].get("link_layer")) for rank in leaders})
+    if len(layers) > 1:
+        detail = ", ".join(f"rank {rank}: {reports[rank].get('link_layer')}" for rank in leaders)
+        return TCP, ("the island leaders' RDMA ports are on different link layers, which "
+                     f"verbs can't connect ({detail})")
+    return VERBS, f"every island leader has a usable RDMA port ({layers[0]})"
 
 
 def _load_built_in(name: str) -> None:
@@ -193,6 +244,11 @@ def register_transport(transport: type[BridgeTransport]) -> type[BridgeTransport
     """
     if not (isinstance(transport, type) and issubclass(transport, BridgeTransport)):
         raise TypeError(f"expected a BridgeTransport subclass, got {transport!r}")
+    if transport.name == AUTO:
+        raise ValueError(f"{AUTO!r} is reserved for automatic selection")
+    if transport.name in _ALIASES:
+        raise ValueError(f"{transport.name!r} is another name of the built-in "
+                         f"{_ALIASES[transport.name]!r} bridge")
     if _BUILT_IN.get(transport.name) not in (None, transport.__module__):
         _load_built_in(transport.name)  # a built-in's name stays the built-in's
     existing = _TRANSPORTS.get(transport.name)
@@ -202,20 +258,37 @@ def register_transport(transport: type[BridgeTransport]) -> type[BridgeTransport
     return transport
 
 
-def resolve_transport(bridge: str | type[BridgeTransport]) -> type[BridgeTransport]:
-    """Turn a transport name or class into a class.
+def resolve_transport(bridge: str | type[BridgeTransport]) -> str | type[BridgeTransport]:
+    """Check a requested bridge: ``"auto"``, a transport name, or a transport class.
+
+    Returns ``"auto"`` (``init()`` chooses, :func:`choose_bridge`) or a transport class.
+    ``"multitcp"`` gives the ``"tcp"`` transport.
 
     Raises:
         ValueError: for an unknown name, or a built-in one whose module can't be imported.
         TypeError: for anything that is neither a name nor a transport class.
     """
+    if bridge == AUTO:
+        return AUTO
     if isinstance(bridge, str):
-        _load_built_in(bridge)
+        name = _ALIASES.get(bridge, bridge)
+        _load_built_in(name)
         try:
-            return _TRANSPORTS[bridge]
+            return _TRANSPORTS[name]
         except KeyError:
-            known = ", ".join(sorted({*_TRANSPORTS, *_BUILT_IN}))
+            known = ", ".join([AUTO, *sorted({*_TRANSPORTS, *_BUILT_IN})])
             raise ValueError(f"unknown bridge transport {bridge!r}; known: {known}") from None
     if isinstance(bridge, type) and issubclass(bridge, BridgeTransport):
         return bridge
     raise TypeError(f"bridge must be a transport name or BridgeTransport subclass, got {bridge!r}")
+
+
+def transport_name(transport: str | type[BridgeTransport]) -> str:
+    """The name a rank reports during discovery for a resolved bridge."""
+    return transport if isinstance(transport, str) else transport.name
+
+
+def asks_for_gloo(transport: str | type[BridgeTransport]) -> bool:
+    """Whether a resolved bridge is Gloo's (or a subclass of it): the one request that
+    gives a job Gloo groups. ``"auto"`` never is."""
+    return isinstance(transport, type) and issubclass(transport, GlooTransport)

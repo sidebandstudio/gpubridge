@@ -99,9 +99,13 @@ def test_settings(monkeypatch):
         verbs_transport.endpoint_settings()
 
 
-def test_verbs_is_a_known_bridge_and_not_the_default():
+def test_verbs_is_a_known_bridge_and_what_auto_chooses_only_with_rdma_on_every_leader():
     assert gpubridge.resolve_transport("verbs") is VerbsTransport
-    assert gpubridge.transport.DEFAULT_TRANSPORT == "gloo"
+    assert gpubridge.transport.DEFAULT_TRANSPORT == "auto"
+    ok = {"ok": True, "link_layer": "InfiniBand"}
+    assert gpubridge.transport.choose_bridge([0, 1], {0: ok, 1: ok})[0] == "verbs"
+    assert gpubridge.transport.choose_bridge(
+        [0, 1], {0: ok, 1: {"ok": False, "reason": "no RDMA device"}})[0] == "tcp"
     assert VerbsTransport.device_tensors is True
 
 
@@ -330,7 +334,7 @@ def test_without_verbs_init_fails_everywhere_and_nothing_falls_back(tmp_path):
          {"env": {**good, VENDOR_ENV: "amd"}, "init_kwargs": {"bridge": "verbs"}}],
         tmp_path,
         [r"The verbs bridge between ranks \[0, 1\] could not be set up",
-         r"never replaced by another transport", r'bridge="gloo"', r"rank 0: \w+"],
+         r"never replaced by another transport", r'bridge="tcp"', r"rank 0: \w+"],
     )
 
 

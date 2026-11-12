@@ -894,6 +894,49 @@ def test_an_idle_watcher_asks_nothing_and_wakes_for_a_posted_request(monkeypatch
         engine.close()
 
 
+class _SlowCheck:
+    """A Store whose ``check`` takes a while, as a busy server's does, and that says
+    when the health watcher is inside it."""
+
+    def __init__(self, store, seconds: float) -> None:
+        self.store, self.seconds = store, seconds
+        self.watcher_inside = threading.Event()
+        self.watcher_left = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def check(self, keys):
+        watcher = threading.current_thread().name == "gpubridge-p2p-health"
+        if watcher:
+            self.watcher_inside.set()
+            time.sleep(self.seconds)
+        found = self.store.check(keys)
+        if watcher:
+            self.watcher_left.set()
+        return found
+
+
+def test_close_waits_for_the_watcher_to_leave_its_store_call(monkeypatch):
+    # A script often exits right after it destroys its groups. A thread still inside a
+    # Store call when the interpreter finalizes is ended there, inside torch's C++, and
+    # that terminates the process: close() must not return while the watcher is in one.
+    store = _SlowCheck(dist.HashStore(), 0.3)
+    link = _BlockedLink()
+    engine = p2p.Engine(link, torch.device("cpu"), 0, store, timedelta(seconds=5))
+    try:
+        monkeypatch.setattr(engine, "match", lambda *args: None)
+        engine.submit(torch.ones(1), 1, 0, True)  # something pending: the watcher polls
+        assert store.watcher_inside.wait(2), "the watcher never asked the Store"
+        assert not store.watcher_left.is_set()
+        engine.close()
+        assert store.watcher_left.is_set(), "close() returned with the watcher in a Store call"
+        assert not engine._watcher.is_alive()
+    finally:
+        link.release.set()
+        engine.close()
+
+
 def test_watcher_exits_when_closed_between_stop_check_and_lock():
     # If close() runs after the watcher has evaluated _stop.is_set() outside the lock,
     # the watcher must check for stop/closed under the lock before clearing _wake,

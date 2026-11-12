@@ -336,7 +336,11 @@ def run_info(topology: gpubridge.Topology) -> dict[str, Any]:
             {"vendor": island.vendor, "ranks": list(island.ranks), "leader": island.leader}
             for island in topology.layout.islands
         ],
-        "bridge": topology.peers[topology.rank].bridge,
+        # The transport the run used; what it asked for (auto unless it named one) and
+        # how init() chose are beside it.
+        "bridge": topology.bridge_name,
+        "bridge_requested": topology.peers[topology.rank].bridge,
+        "bridge_selection": topology.selection,
         # bridge="ucx" on a leader: the path its last collective took (host, direct
         # or staged); scripts refresh it after their collectives. None otherwise.
         "bridge_path": getattr(topology.bridge, "last_path", None),

@@ -172,7 +172,7 @@ def run_gate(topology, *, arm, software_only, opt_name="sgd", control="none",
         layout = [list(i.ranks) for i in topology.layout.islands]
         report.update(layout=layout, policy=topology.policy_name, run_kind=topology.run_kind,
                       island_backend=dist.get_backend(topology.island_group),
-                      transport=topology.peers[rank].bridge)
+                      transport=topology.bridge_name)
         if layout != [[0, 1], [2, 3]] or topology.bridge_compression:
             raise ValueError("bridge gate requires two equal islands and compression OFF")
     else:

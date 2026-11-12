@@ -1,10 +1,40 @@
 # A multi-stream TCP bridge transport in Rust
 
-**Status: stage 1 implemented as an opt-in transport, `bridge="multitcp"`,
-tested on CPU (loopback TCP between processes) and compared with the Gloo
-bridge in two step-08 jobs between a V100 node and an MI50 node, where it
-missed the gate set for keeping it ([below](#stage-1-on-hardware-and-the-gate)):
-the work stops at stage 1.** The Gloo bridge stays the default and the reference.
+**Status: `bridge="tcp"` (`"multitcp"` is its older name), and since 2026-11-11
+what the default, `bridge="auto"`, runs on wherever the island leaders don't all
+have a usable RDMA device.** Tested on CPU (loopback TCP between processes),
+where it reproduces the Gloo bridge's results bit for bit, and compared with the
+Gloo bridge in two step-08 jobs between a V100 node and an MI50 node, where it
+ran at about the Gloo bridge's speed and so missed the gate it was first judged
+by, which asked for a speed-up ([below](#stage-1-on-hardware-and-the-gate)). As
+the default, with gpubridge's own default process group, it has not run on a GPU.
+The Gloo bridge is opt-in (`bridge="gloo"`), and stays the reference in tests.
+
+## Why it is the default
+
+Not for speed. On Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can
+abort a process at interpreter exit, after training has finished
+([RUNTIME_INVENTORY.md](RUNTIME_INVENTORY.md#6-the-gloo-decisions-reversed-2026-11-11)).
+The bridge itself creates no Gloo group and has no Gloo thread, and a job on it that
+doesn't ask for Gloo some other way (the `flat-gloo` policy) has none: the bridge is not a process group,
+its rendezvous is the c10d store, and its threads never touch a Python object
+(["Threading"](#design)). (torch would add Gloo helper groups to the islands at
+its debug level DETAIL; `init()` refuses that unless the job opts in with
+`allow_debug_gloo` / `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`: RUNTIME_INVENTORY.md,
+section 6.) What it had to show to take Gloo's place is the same
+results and no worse speed, not the 20% the first gate asked:
+
+- the same bits as the Gloo bridge: `tests/test_parity_fixture.py` (SHA-256 hashes
+  generated once by the Gloo bridge for every dtype, SUM, MAX, MIN and AVG, two to
+  four leaders, and sizes on each side of the 4 MiB chunk; this bridge reproduces
+  them in jobs with no Gloo group), with the one difference the fixture documents:
+  a floating-point SUM over three or more leaders that rounds is added in ring
+  order, not Gloo's order;
+- 0.88 to 1.07 times the pinned Gloo bridge's time from 64 MB to 1 GB between two
+  machines (the two step-08 jobs below);
+- no rank exiting with a signal in 300 repetitions of a job that returns straight
+  into interpreter exit, where the same job on the Gloo bridge does
+  (`scripts/exit_abort.py`; the CHANGELOG has the counts).
 
 ## Why
 
@@ -52,11 +82,32 @@ the other side files them. Leaders whose protocol, chunk size or stream count
 differ fail `init()` on every rank, and a one-message handshake each way checks
 that every link carries data, as the UCX transport does.
 
-**Threading.** Every connection has a sending thread and a receiving thread,
-started at connect and stopped at `close()`. Python calls in on one thread
+**Threading.** Every connection has a sending thread and a receiving thread
+(`gb-tcp-send`, `gb-tcp-recv`), started at connect and joined by `close()`;
+`gb-tcp-accept` takes the connections lower-index members dial, and ends when
+it has them. Python calls in on one thread
 (ctypes releases the GIL for the call), posts sends and receives, and waits on
-the ids they return. The native threads never call back into Python, so no
-work depends on the GIL.
+the ids they return. **The native threads never call into Python and never
+hold a Python object**, so no work depends on the GIL, and no thread here can
+need it while the interpreter finalizes: the library takes no callback, links
+nothing of Python's, and sees only the raw byte ranges of posted operations.
+The rule is written in the crate's docs (`src/lib.rs`, "Threads never touch
+Python") and checked by `tests/test_native_threads.py`. gpubridge closes the
+bridge in `destroy()`, and from an exit handler for a script that never called
+it, so the threads are joined before the interpreter is torn down. The handler
+is best effort (it does not run after `os._exit`, SIGKILL or a fatal abort), and
+those joins have no time limit: only the accepting thread is given a deadline
+(below), because the sending and receiving threads can still touch the caller's
+memory and are never detached.
+
+**Point-to-point.** The torch backend's cross-island `send` and `recv` (and CPU
+tensors on a GPU job) run over lanes of this library too
+(`src/gpubridge/multitcp/p2p.py`): each matched (source, destination, tag) lane
+has a two-member worker of its own with one connection, the sender dialing the
+receiver, set up through the backend group's store by the two ranks of the lane
+only. The common engine (`src/gpubridge/p2p.py`) stages, chunks and orders the
+messages, as for the Gloo and UCX links. Tested on CPU by the whole of
+`tests/test_p2p.py`; not run on GPUs.
 
 **Messages.** A message is one frame, a 16-byte header (tag, length) then the
 bytes, on one connection: sends to a peer go round-robin over its connections,
@@ -167,9 +218,13 @@ basis alone. Either way the numbers go in
 **Outcome: the gate was not met.** In the two step-08 jobs (a V100 and an MI50,
 commit 23180fe of #66's branch), pinned multitcp took 1.07 and 1.02 times the
 pinned Gloo bridge's time at 64 MB, 0.90 and 0.90 at 256 MB and 0.88 and 0.88 at
-1 GB ([BENCHMARKS.md](BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)). Stage 1
-stays opt-in as it is, stage 2 does not start on this basis, and `import gpubridge`
-loads the transport only when a job names it.
+1 GB ([BENCHMARKS.md](BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)). Stage 2
+did not start on this basis, and `import gpubridge` loads the transport only when
+a job runs on it. That gate judged the bridge as a speed-up over Gloo, and as one
+it failed. Since 2026-11-11 it is judged as what lets Gloo leave the job
+(["Why it is the default"](#why-it-is-the-default)): for that, about Gloo's speed
+is enough. Those two jobs ran it by name, beside a Gloo default group; nothing
+has run on GPUs since it became the default.
 
 ## Not done
 

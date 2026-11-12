@@ -33,13 +33,29 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ReduceOp
 
+from gpubridge.rendezvous import DEFAULT_TIMEOUT, default_store
+from gpubridge.rendezvous import wait_for as _wait_for
 from gpubridge.transport import BridgeTransport, scoped_name
-from gpubridge.ucx.transport import _REDUCE, _segments, _wait_for, tag
 
-#: The deadline when ``init()`` gave none: torch's default group timeout.
-DEFAULT_TIMEOUT = timedelta(minutes=30)
 #: The tag step of the connection handshake.
 HANDSHAKE = 0xFFF
+
+_REDUCE = {ReduceOp.SUM: torch.Tensor.add_,
+           ReduceOp.MAX: lambda a, b: torch.maximum(a, b, out=a),
+           ReduceOp.MIN: lambda a, b: torch.minimum(a, b, out=a)}
+
+
+def tag(seq: int, step: int, sender: int, chunk: int) -> int:
+    """A 64-bit message tag: collective number, step, sending member, chunk."""
+    return ((seq & 0xFFFFFF) << 40) | ((step & 0xFFF) << 28) | ((sender & 0xFF) << 20) | (
+        chunk & 0xFFFFF)
+
+
+def _segments(numel: int, parts: int) -> list[tuple[int, int]]:
+    """(start, length) in elements of ``parts`` near-equal segments."""
+    base, extra = divmod(numel, parts)
+    bounds = list(itertools.accumulate([base + (i < extra) for i in range(parts)], initial=0))
+    return [(bounds[i], bounds[i + 1] - bounds[i]) for i in range(parts)]
 
 
 def _pieces(numel: int, chunk: int) -> list[tuple[int, int]]:
@@ -79,7 +95,7 @@ class TaggedBridge(BridgeTransport):
                ) -> TaggedBridge | None:
         timeout = timeout or DEFAULT_TIMEOUT
         link = scoped_name(ranks) or next(cls._links)
-        store = dist.distributed_c10d._get_default_store()
+        store = default_store()
         key = f"gpubridge/{cls.name}/{link}"
         members, rank = list(ranks), dist.get_rank()
         deadline = time.monotonic() + timeout.total_seconds()

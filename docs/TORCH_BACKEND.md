@@ -124,9 +124,17 @@ A group of every rank shares the world's topology. A subgroup gets a topology
 of its own, over its members only ("Subgroups and HSDP", below). Ranks
 outside a group get what torch gives any non-member.
 
-**Setup at the first collective.** gpubridge needs its own groups: a Gloo group
-of every rank (discovery, `barrier()`, `flat-gloo`), one per island on its
-native backend, and the bridge. `dist.new_group` can't run inside
+**Setup at the first collective.** (Since 2026-11-11 no Gloo group of every
+rank is part of it unless the bridge is Gloo: discovery and `barrier()` go
+through the job's c10d store, and where this section says "Gloo groups" below it
+describes `GPUBRIDGE_BRIDGE=gloo`. docs/RUNTIME_INVENTORY.md, section 6, has the
+whole change. `gpubridge.init()` on any other bridge now creates its default
+group on this backend and builds the topology at once. At torch's debug level
+DETAIL the setup is refused on every rank unless `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`:
+torch would wrap each island group around a Gloo helper group.) gpubridge needs its own
+groups: one per island on its native backend, and the bridge; with
+`bridge="gloo"` also a Gloo group
+of every rank (`barrier()`, `flat-gloo`). `dist.new_group` can't run inside
 `init_process_group`, because the default group doesn't exist yet. So the
 process group builds them at its first collective. Every rank makes the same
 collectives in the same order, so every rank creates the same groups at the
@@ -134,10 +142,11 @@ same point. Discovery is gpubridge's usual one: every rank's vendor, build,
 GPU and settings are exchanged, and any problem fails that first collective on
 every rank with gpubridge's usual message. The policy and bridge transport,
 which `gpubridge.init()` takes as arguments, come from `GPUBRIDGE_POLICY` and
-`GPUBRIDGE_BRIDGE` (default `auto` and `gloo`), checked across ranks like the
+`GPUBRIDGE_BRIDGE` (both `auto` by default; `auto` resolves to the verbs or
+the TCP bridge), checked across ranks like the
 other settings. A setting one rank can't read at all (an unknown policy name,
-a malformed `GPUBRIDGE_*` value) also fails every rank. The Gloo groups are
-created first, and every rank's error is exchanged over them before
+a malformed `GPUBRIDGE_*` value) also fails every rank: its error is that
+rank's discovery record in the store, read by every rank before
 anything else, so no rank is left waiting in `new_group`. These groups are
 named like a subgroup's (below), `gpubridge:world{generation}.{ranks}.{k}`, not from
 torch's count of the groups each process has created: the ranks can reach the
@@ -149,8 +158,8 @@ advances a process-local generation on every rank, including after a backend
 group is destroyed and recreated inside a Gloo job. Its groups and transport
 links therefore cannot reuse names or store keys from an earlier setup. All
 ranks must enter these setups in the same order. Setup synchronizes each new
-group's members only; all ranks visit the groups in the same order, and the
-discovery exchange on the world Gloo group follows their creation. No other
+group's members only; all ranks visit the groups in the same order, after the
+discovery exchange through the store. No other
 thread may create process groups during setup. Transport links have their own
 namespace and counter, separate from torch groups.
 
@@ -175,19 +184,30 @@ namespace and counter, separate from torch groups.
 | `_reduce_scatter_base`, `reduce_scatter_single`, `reduce_scatter_tensor_coalesced` (SUM, AVG) | `reduce_scatter_tensor` |
 | `reduce_scatter` (list form) | the inputs concatenated, then `reduce_scatter_tensor` |
 | `barrier` | `barrier` |
-| `gather`, `scatter` | CPU tensors only, on the backend's Gloo group (below) |
+| `gather`, `scatter` | CPU tensors only: an `all_gather_into_tensor` of which the root keeps the rows, a `broadcast` of the root's rows of which each rank keeps its own (with `bridge="gloo"`, on the backend's Gloo group) |
 | `_start_coalescing` / `_end_coalescing` | calls run as they come; `_end_coalescing` returns a `Work` for all of them |
 
 - **CPU tensors.** gpubridge collectives take tensors on the rank's device.
-  So in a GPU job, CPU tensors (some libraries all_reduce CPU flags or counts)
-  go to a Gloo group of every rank that belongs to the backend. It is kept
+  So in a GPU job, a collective on CPU tensors (some libraries all_reduce CPU
+  flags or counts; object collectives) is staged: a contiguous copy on the
+  rank's GPU, the gpubridge collective on it, and a copy back before the
+  returned `Work` completes. Collectives that only copy (broadcast, all-gather)
+  carry the tensor's bytes, so any dtype travels; a reduction needs a dtype
+  gpubridge reduces. Tested on CPU with the staging forced
+  (`tests/test_no_gloo.py`); not run on a GPU (HARDWARE_VALIDATION.md item 46).
+  With `bridge="gloo"` they go instead to a Gloo group of every rank that
+  belongs to the backend, kept
   apart from the one gpubridge's worker thread uses, so the two threads never
-  interleave collectives on one group. AVG there is a SUM and a division, as
-  in gpubridge. `backend="gpubridge"` therefore behaves like
-  `"cpu:gloo,cuda:gpubridge"` on every supported torch release.
-- **Gather and scatter** of CPU tensors take the same group, in any job.
-  That's what `gather_object` and `scatter_object_list` use, and
-  `torch.distributed.checkpoint` plans its saves with them. The object
+  interleave collectives on one group; AVG there is a SUM and a division, as
+  in gpubridge, and the backend behaves like
+  `"cpu:gloo,cuda:gpubridge"`.
+- **Gather and scatter** of CPU tensors, in any job: every rank's bytes are
+  all-gathered through the topology and the root keeps the rows; the root's
+  rows are broadcast and each rank keeps its own. That moves `world_size` times
+  the bytes a gather would, which is what `gather_object` and
+  `scatter_object_list` can afford, and
+  `torch.distributed.checkpoint` plans its saves with them. With
+  `bridge="gloo"` they are a gather and a scatter on the backend's Gloo group. The object
   collectives are tested; a full checkpoint save isn't.
 - **Refused before any communication**, with an error naming the operation and
   the backend:
@@ -213,14 +233,17 @@ namespace and counter, separate from torch groups.
   work on the groups it built.
 - A custom bridge transport or policy that ran a collective on the default
   group during setup would wait on the backend's own setup. That is refused
-  with an error, pointing at `topology.world_group`.
+  with an error, pointing at the c10d store (`gpubridge.rendezvous`), and at
+  `topology.world_group` where `bridge="gloo"` made one.
 
 **gpubridge internals.** Two changes, invisible to the existing API:
-- `Topology` gains `world_group`: a new Gloo group of every rank under the
-  backend. After `gpubridge.init()` it is None, meaning the default group,
-  which is looked up when used rather than held.
-- Discovery, `barrier()` and `flat-gloo` use `world_group` instead of the
-  default group, which under the backend is the backend itself.
+- `Topology` gains `world_group`: with `bridge="gloo"`, a new Gloo group of
+  every rank under the backend (after `gpubridge.init(bridge="gloo")` it is
+  None, meaning the default group, which is looked up when used rather than
+  held). On any other bridge it is None and no such group exists.
+- `barrier()` and `flat-gloo` use `world_group` where there is one; otherwise
+  `barrier()` counts through the store and `flat-gloo` makes its own Gloo
+  group when it is first used (`gpubridge.topology.gloo_world`).
 
 ## Subgroups and HSDP
 
@@ -275,8 +298,9 @@ world's, and only by its members, with `new_group(...,
 use_local_synchronization=True)`. torch calls the creator on members only, so
 non-members can't take part in a group creation that every rank would have
 to join.
-- **Same order on every member:** a Gloo group of the members (barrier,
-  `flat-gloo`, CPU tensors), the islands in leader order, then the bridge.
+- **Same order on every member:** with `bridge="gloo"` a Gloo group of the
+  members (barrier, `flat-gloo`) and one for CPU tensors; then the islands in
+  leader order, then the bridge.
   The layout is a pure function of the members and the world's labels, so
   every member creates the same groups in the same order.
 - **The world comes first.** A subgroup's first collective also sets up the
@@ -363,9 +387,14 @@ one rank per island, so nothing went through a native group. The UCX lanes,
 chunked staging and native GPU batches below haven't run on GPUs.
 
 Within an island, the call goes straight to the native process group
-(NCCL/RCCL on GPU, Gloo in simulation). CPU tensors in a GPU job use Gloo.
-Between islands, `BridgeTransport.create_p2p` supplies an all-member link;
-Gloo reuses the existing discovery group and transfers host-staged raw bytes.
+(NCCL/RCCL on GPU, Gloo in simulation). Between islands, and for CPU tensors
+in a GPU job, `BridgeTransport.create_p2p` supplies an all-member link that
+transfers host-staged raw bytes: on `bridge="tcp"` (what `auto` usually is) one
+TCP connection per (source, destination, tag) lane, set up through the store by
+the two ranks of the lane (`src/gpubridge/multitcp/p2p.py`, the UCX lanes'
+shape); on `bridge="gloo"` the job's Gloo group of every rank; on `"ucx"` its
+own lanes. `bridge="verbs"` has no such link yet and refuses. The TCP lanes
+have run on CPU only (HARDWARE_VALIDATION.md item 47).
 This is separate from the leader-only collective link and does not create
 another process group. Collective-only custom transports need to implement
 the optional hook before carrying cross-island P2P.

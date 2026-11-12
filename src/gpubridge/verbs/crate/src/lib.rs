@@ -18,6 +18,27 @@
 //! - [`Registrar`] (`direct.rs`, [`gpu`]): device memory through dma-buf or peer memory,
 //!   host buffers, and each rendezvous receive's write window.
 //!
+//! # Threads never touch Python
+//!
+//! The rule, for every thread this crate starts (the endpoint's completion thread,
+//! `gpubridge-verbs`, and in the test build the MOCK fabric's `verbs-test-fabric-*`
+//! threads): **it never calls into Python and never holds, reads or releases a Python
+//! object.** A native thread that needs the interpreter's lock (the GIL) while the
+//! interpreter finalizes is ended by CPython 3.12 in the middle of its work, which is how
+//! a Gloo worker thread aborts a process at exit; no thread here can ever need the GIL:
+//!
+//! - the interface takes no callback from Python: no `gb_verbs_*` function has a
+//!   function-pointer parameter. (The function pointers in `gpu.rs` are the CUDA and
+//!   ROCm driver entry points this library looks up itself.)
+//! - the crate depends on the standard library only and links no Python library;
+//! - what a thread sees of the caller is a posted operation's raw memory (an address
+//!   and a length, never a tensor or any other object).
+//!
+//! `gb_verbs_close` stops and joins the completion thread before it returns. gpubridge
+//! closes the bridge in `destroy()`, and from an exit handler for a job that never called
+//! it. `tests/test_native_threads.py` checks the rule against the source and the built
+//! library.
+//!
 //! Nothing here has run on RDMA hardware or a GPU.
 
 mod cache;

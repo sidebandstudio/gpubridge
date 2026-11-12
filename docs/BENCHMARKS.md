@@ -6,6 +6,12 @@ a row or section says otherwise; [the verbs bridge on one node](#the-verbs-bridg
 is from 2026-10-20. Host names, user names and paths are left out; the raw
 records keep them.
 
+**"The default bridge" in these measurements is the Gloo bridge.** They predate
+2026-11-11, when the default became `bridge="auto"` (a Rust bridge: verbs or
+TCP) and Gloo became opt-in. Nothing here was measured on the new default; the
+[multitcp rows](#a-multi-stream-tcp-bridge-prototype) are the TCP bridge it runs
+on without RDMA, measured by name beside a Gloo default group.
+
 The plan was a comparison of NVIDIA with NVIDIA, AMD with AMD and NVIDIA with AMD.
 So far only the NVIDIA + AMD half has run: a pair of two GPUs of one type, in one
 partition, waits for Research Computing to confirm it is within the partitions'

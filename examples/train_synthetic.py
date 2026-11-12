@@ -1,8 +1,8 @@
 """Data-parallel training on synthetic data, with gradients synced by gpubridge.
 
 A small MLP learns a fixed random classification task. Each rank trains on its
-own batches. The model is wrapped in DistributedDataParallel on gpubridge's
-Gloo world group, with gpubridge.ddp_comm_hook registered: DDP buckets the
+own batches. The model is wrapped in DistributedDataParallel on the job's
+default group (gpubridge's own), with gpubridge.ddp_comm_hook registered: DDP buckets the
 gradients and overlaps their sync with backward, and each bucket is averaged
 with an async gpubridge.all_reduce. So the same script trains on NVIDIA, AMD
 or both at once. It reports throughput (samples/sec across all ranks) and
@@ -161,8 +161,8 @@ def main() -> None:
     device, rank, world = topology.device, topology.rank, topology.world_size
 
     # Same seed everywhere; DDP also broadcasts rank 0's parameters when it wraps
-    # the model. The default group is gpubridge's Gloo world group, which spans
-    # both vendors; the hook sends every gradient bucket through gpubridge.
+    # the model. The default group is gpubridge's own, which spans both vendors;
+    # the hook sends every gradient bucket through gpubridge as one all_reduce.
     torch.manual_seed(0)
     model = make_model(args.dim, args.layers, args.classes).to(device)
     model = DistributedDataParallel(

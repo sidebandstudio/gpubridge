@@ -4,7 +4,6 @@ from functools import partial
 
 import pytest
 import torch
-import torch.distributed as dist
 from _harness import run_ranks
 from test_ops import Exploding, Keep, gather
 from torch import nn
@@ -69,8 +68,14 @@ def _check_ddp_averages_exactly(topology, expected_policy):
     # policy. DDP regroups its buckets after the first step, so count at least one
     # per step, and the same records on every rank.
     summary = [(r.seq, r.op, r.reduce_op, r.policy) for r in keep.records]
-    assert len(summary) >= STEPS
-    assert {s[1:] for s in summary} == {("all_reduce", "avg", expected_policy)}
+    reduces = [s for s in summary if s[1] == "all_reduce"]
+    assert len(reduces) >= STEPS
+    assert {s[1:] for s in reduces} == {("all_reduce", "avg", expected_policy)}, summary
+    # On a bridge other than Gloo the default group is gpubridge's own, so DDP's own
+    # exchange on it (it broadcasts its rebuilt buckets after the first step) is carried
+    # by gpubridge too, and observed; with bridge="gloo" that stays on the Gloo group.
+    others = {s[1] for s in summary} - {"all_reduce"}
+    assert others <= ({"broadcast"} if topology.gloo_free else set()), summary
     assert len({tuple(s) for s in gather(summary)}) == 1
     # And every rank ends with identical parameters.
     everyone = gather([p.detach().clone() for p in model.parameters()])
@@ -103,7 +108,7 @@ def _check_failure_reaches_backward(topology):
     # Every later collective refuses to start: the groups may be inconsistent.
     with pytest.raises(RuntimeError, match="an earlier async gpubridge collective failed"):
         gpubridge.all_reduce(torch.ones(2))
-    dist.barrier()  # the Gloo world group still works, so the job can shut down cleanly
+    gather(None)  # the ranks still meet (through the store), and shut down cleanly
 
 
 def test_a_failed_bucket_makes_backward_raise_on_every_rank(tmp_path):

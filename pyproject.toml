@@ -29,8 +29,9 @@ dependencies = [
     # 2.8, tearing down a Gloo group could deadlock (see gpubridge.destroy();
     # fixed upstream by https://github.com/pytorch/pytorch/pull/154976).
     "torch>=2.8",
-    # torch.distributed.all_gather_object, used for discovery, needs numpy,
-    # which torch does not install.
+    # torch.distributed's object collectives (all_gather_object and the rest, which
+    # scripts and tools call on the job's groups) need numpy, which torch does not
+    # install. (Discovery itself goes through the c10d store.)
     "numpy",
 ]
 

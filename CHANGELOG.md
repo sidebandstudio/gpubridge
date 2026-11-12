@@ -253,6 +253,193 @@ hardware.
 
 ## [Unreleased]
 
+### Changed: the default bridge, and no Gloo unless asked for (2026-11-11)
+
+**The default bridge changed, and a job no longer creates a Gloo process group
+unless it asks for one.** Read this before upgrading a job.
+
+- **The default bridge is `bridge="auto"`, a Rust bridge, never Gloo.** `init()`
+  resolves it once, the same on every rank: `"verbs"` (RDMA) when every island
+  leader passes the verbs bridge's own check for a usable RDMA device and all
+  leaders are on one link layer, otherwise `"tcp"`, the Rust TCP bridge
+  (`"multitcp"` until now, kept as another name for it). The choice is recorded
+  in `Topology.selection` and the bridge's `telemetry()`, logged by the
+  `gpubridge` logger, and never changes during the job. A bridge asked for by
+  name is never replaced: `bridge="verbs"` where verbs can't run still fails
+  `init()` on every rank and never drops to TCP. `GPUBRIDGE_BRIDGE` now also
+  names the bridge for `gpubridge.init()` when the script passes none.
+- **Gloo is no longer created unless asked for.** Until now every job made its
+  default process group a Gloo group of every rank, ran discovery and
+  `barrier()` on it, and under the torch.distributed backend made two more.
+  Now discovery is a record per rank in the job's c10d store, read before any
+  process group exists; `barrier()` is a counter in the store; and the default
+  process group is gpubridge's own (`GpubridgeProcessGroup`, as under
+  `backend="gpubridge"`), so `torch.distributed` calls on the default group run
+  through gpubridge and observers see them. Gloo groups are created only by
+  `bridge="gloo"` (opt-in, kept for one release: the whole job as it was
+  before), by the `flat-gloo` policy (which makes its own group), and in CPU
+  simulation for an island of several ranks, a test device. A GPU job on the
+  default has no thread named `pt_gloo_runloop` or `gloo_tcp_loop`, with one
+  qualification, next.
+- **torch's debug level DETAIL is refused unless the job opts in.** At
+  `TORCH_DISTRIBUTED_DEBUG=DETAIL` (or `torch.distributed.set_debug_level`)
+  torch wraps every NCCL, RCCL or Gloo group it creates in a checker that runs
+  on a Gloo helper group, which would put Gloo and its worker threads back
+  into a job that never named it. `init()` (both APIs) now refuses a job that
+  didn't ask for Gloo at that level: on every rank, with one message that says
+  why and what to do, before any island group exists. Lower the level, or
+  accept the helper groups and their exit-abort exposure with
+  `gpubridge.init(allow_debug_gloo=True)` or `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`
+  (new; the same on every rank). gpubridge never changes the level. Not
+  covered: a level raised after `init()` (checked again only when a subgroup is
+  set up, and then on each member by itself). Tested on CPU with simulation's
+  Gloo islands standing in for NCCL ones (`tests/test_debug_gloo.py`); that
+  torch wraps an NCCL group the same way is read from torch 2.8.0 and 2.15.0,
+  not run on a GPU.
+- **A refusal found in discovery reaches the ranks that read the discovery
+  records, and rank 0 waits for them to, up to a deadline.** A rank that cannot
+  resolve its own settings (an unknown bridge or policy name, a bridge module
+  that fails to import, an invalid `GPUBRIDGE_*` value) publishes the error as
+  its discovery record before it raises, so the others raise with its message
+  instead of waiting for it until the timeout. Each rank marks in the store
+  that it has read the records, and when they make the job fail (a problem, a
+  mismatch, the DETAIL refusal, two ranks on one GPU, a policy that doesn't
+  fit: all checked before any island group exists; with `gpubridge.init()`
+  before the default group too) rank 0 waits for the other ranks' marks before
+  it raises. Under a `tcp://` or plain `env://` rendezvous the store's server
+  lives in rank 0; without this a slower rank could get a network error from
+  a store that had gone, not the reason (`tests/test_store_owner.py` stops a
+  rank between its write and its reads to show it). The exact promise:
+  refusals decided from the discovery records have the same `RuntimeError`
+  text on ranks that read those records; a rank with a malformed local setting
+  keeps its original exception (`ValueError`). Rank 0 waits for other ranks'
+  read marks only until its original discovery deadline, the one the wait for
+  the records had, not a second timeout after it. If that deadline expires
+  first, it logs the unread ranks when the store permits, then raises the
+  original refusal; a reader still delayed at that point can instead receive
+  a store error when the owner exits, even if it is alive and connected. The
+  deadline bounds polling, not synchronous store calls or total init time. A
+  rank that never published is named at the timeout on every rank, as before.
+  It also needs discovery keys no earlier job wrote (a fresh store per job, or
+  a namespace per job or attempt): starting a new job on a persistent store
+  under a prefix an earlier job used is not supported, as that job's records
+  and read marks would be taken for the new one's. A job that starts pays one
+  more store
+  write per rank and waits for no mark. Not covered: failures after discovery
+  (a bridge that cannot connect is published through the bridge's own status
+  keys, as before).
+- **Why.** On Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can abort
+  a process at interpreter exit (signal 6, "terminate called without an active
+  exception"), after training has finished; it reproduces with torch alone.
+  docs/RUNTIME_INVENTORY.md, section 6, records the reversal of the 2026-10-20
+  decision to keep Gloo, and what replaced each use of it.
+- **What you need to do.** The island leaders of a mixed job need the bridge's
+  Rust library, where the Gloo bridge needed nothing beyond torch: a built
+  library, or cargo to build it on first use.
+  `python -m gpubridge.multitcp build` (cargo, no network), or
+  `GPUBRIDGE_MULTITCP_LIB`; without it `init()` fails on every rank and says
+  so. To keep a job exactly as it was, set `GPUBRIDGE_BRIDGE=gloo` (or pass
+  `bridge="gloo"`). Code that relied on the default group being Gloo
+  (`dist.get_backend() == "gloo"`, `topology.bridge_group`, a monitoring tool's
+  own exchange on the default group while observing) needs a look: the default
+  group's collectives are gpubridge collectives now, they take sequence numbers,
+  and after a failed collective they refuse to start like any other.
+- **Also changed with it:**
+  - Under the torch.distributed backend, CPU tensors on a GPU job are staged
+    onto the rank's GPU and carried by the topology instead of a Gloo group;
+    `gather` and `scatter` run as an all-gather and a broadcast of bytes.
+  - Cross-island point-to-point on the TCP bridge runs over TCP lanes of its
+    own (`src/gpubridge/multitcp/p2p.py`). The verbs bridge still has none.
+  - A one-rank island in CPU simulation is a `SoloGroup`: a Python group with
+    no backend, connection or thread.
+  - A failed collective on a group of the backend now raises from the
+    `torch.distributed` call that made it. Before, a synchronous
+    `dist.all_reduce` returned as if it had worked (torch's Work for a Python
+    backend doesn't raise from `wait()`), and only the next collective refused
+    to start. DDP without a comm hook is called from C++ and still learns of a
+    failure at its next collective.
+  - `gpubridge.destroy()` is no longer the only way out: an exit handler closes
+    a bridge the script left open (joining the bridge's threads) before the
+    interpreter finalizes, does nothing after `destroy()`, and nothing in a
+    forked child. It is best effort: it runs at a normal interpreter exit, not
+    after `os._exit`, SIGKILL or a fatal abort; handlers registered after
+    gpubridge was imported run before it; an exception from a policy's `close()`
+    leaves the bridge unclosed; and it is not bounded in time. Draining and the
+    TCP accepting thread have deadlines, but the TCP sending and receiving
+    threads and the verbs completion thread are joined without one, since they
+    can still touch the caller's memory and are never detached; a device call
+    that never returned would hold the exit. Teardown faults on hardware were
+    not tested. The TCP library's threads are named (`gb-tcp-accept`,
+    `gb-tcp-send`, `gb-tcp-recv`); both Rust crates state, and
+    `tests/test_native_threads.py` checks, that their threads never touch a
+    Python object.
+  - The kit's records report the bridge a run used (`run.bridge`), beside what
+    it asked for and how `init()` chose. `check.py` and `bench_all_reduce.py`
+    keep `--bridge gloo` as their own default: the path their recorded results
+    were measured on.
+- **What was validated, and what was not.**
+  - On CPU (Linux aarch64 containers; Python 3.10.22 with torch 2.8.0 and
+    Python 3.12.3 with torch 2.15.0), the whole suite on the new default and
+    again with `GPUBRIDGE_BRIDGE=gloo`: no failure in any of the four runs.
+    Python 3.10 (without `tests/test_gpu_jobs.py`, as CI's 3.10 leg): 1675
+    passed and 123 skipped on each. Python 3.12 (everything): 1771 passed and
+    81 skipped on each. Getting there took three corrections to tests that had
+    each failed once in a whole-suite run, none of them in the bridges: a test
+    that kept a simulated island's Gloo group alive into interpreter exit
+    (torch's abort again: 11 of 380 runs of that test alone), a check that
+    listed a thread the kernel had not yet removed after its join, and two
+    ranks that could close before the other had counted its threads.
+  - The same bits as Gloo: `tests/test_parity_fixture.py` holds the SHA-256 of
+    1240 results, 1080 of them generated once by the Gloo bridge (every supported
+    dtype, SUM, MAX, MIN and AVG, 2, 3 and 4 bridge members, sizes one element
+    below, at and above 256 KiB and 4 MiB). The TCP bridge, the verbs bridge on
+    its MOCK fabric and the UCX bridge over TCP reproduce every one in jobs with
+    no Gloo group. With two bridge members, which is every NVIDIA + AMD job, that
+    is on rounding data. With three or four, the Rust and UCX bridges add a
+    floating-point SUM in ring order, which is not Gloo's: on rounding data
+    Gloo gave the ring's bits in 27 of 160 cases, so those 160 are
+    pinned to the ring order instead, and the Gloo-generated ones use sums that
+    are exact. **So this is not bit parity with Gloo everywhere: in 133 of the
+    160 order-sensitive cases with three or four leaders the default now gives
+    other last bits than the Gloo bridge did.** The order is the one the opt-in
+    ring transports (`multitcp`, `verbs`, `ucx`) always used, both results are
+    correct sums, and an NVIDIA + AMD job has two leaders, where it cannot
+    arise. The 1240 hashes are not a general numerical qualification. They do
+    not cover: all-gather, reduce-scatter and gather, point-to-point, GPU and
+    device paths, reductions inside an island or islands of unequal size, more
+    than four leaders, zero-sized or non-contiguous tensors, a broadcast from
+    any rank but the last, NaN, infinities and signed zeros, compression, or
+    speed. Other tests cover some of those. The file was generated on Linux aarch64; on x86-64, which was
+    only emulated (qemu), the TCP bridge, the verbs bridge on its MOCK fabric
+    and Gloo itself gave the same hashes (the UCX bridge was not built there).
+  - The exit abort (`scripts/exit_abort.py`: four DDP ranks returning straight
+    into interpreter exit, 300 repetitions of each arm side by side, Linux,
+    Python 3.12.3, torch 2.15.0): on the TCP bridge 0 of 300 repetitions had a
+    rank exit non-zero (1200 exits, all 0); on the Gloo control 32 of 300 did
+    (33 ranks ended by signal 6, each with "terminate called without an active
+    exception"). The same with every rank calling `destroy()` first: 0 of 300
+    on the TCP bridge and 0 of 300 on the control, so only the trial without
+    `destroy()` shows that the test can see the abort.
+  - Found on the way and not fixed, a defect of the UCX bridge that is older
+    than this change (`auto` never selects UCX, so the default cannot meet it;
+    the exit handler can make a forgotten UCX teardown happen earlier than it
+    used to): on the UCX bridge (`bridge="ucx"`, opt-in)
+    a leader that closes its bridge while another is still inside the job's
+    last collective fails that one ("UCX peer failed ... Connection reset by
+    remote peer"): 16 of 40 four-leader jobs that end with a large broadcast
+    and an immediate `destroy()`, the same at 82eca8e. End such a job with
+    `gpubridge.barrier()` before `destroy()` (0 of 40). The TCP bridge and the
+    verbs bridge on its MOCK fabric did not show it (0 of 200 and 0 of 100).
+  - **On hardware, nothing here was run.** The verbs bridge has run only on one
+    node through one InfiniBand adapter in loopback, staged through host memory
+    (2026-10-20, below). The TCP bridge ran between a V100 node and an MI50 node
+    by name, beside a Gloo default group (23180fe). **Nothing in this change was
+    run on a GPU**: not discovery through the store, not gpubridge's own default
+    group over NCCL or RCCL islands, not the store barrier, not `auto`'s device
+    check on a real RDMA device, not CPU tensors staged through a GPU, not the TCP
+    point-to-point lanes, not the exit handler with NCCL groups.
+    HARDWARE_VALIDATION.md items 44 to 50 say what must be run.
+
 ### Hardware validation
 
 - **2026-10-20: one node with 4x Tesla V100-SXM2-32GB, driver 545.23.08,

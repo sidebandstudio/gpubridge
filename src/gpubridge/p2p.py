@@ -41,6 +41,8 @@ MATCH_POLL_MAX = 0.002
 #: How often the health watcher asks the Store for a published failure while operations
 #: are pending. With none pending it asks nothing: ``submit`` wakes it again.
 WATCH_INTERVAL = 0.05
+#: How long ``Engine.close`` waits for the watcher to leave its last Store call.
+WATCHER_JOIN = 1.0
 
 
 def chunk_bytes_setting() -> int:
@@ -307,6 +309,12 @@ class Engine:
 
         In-flight Gloo requests retain their buffers in daemon lane threads
         until torch destroys the group or its timeout passes.
+
+        The health watcher is joined (for at most ``WATCHER_JOIN`` seconds: it ends
+        after the Store call it may be in). A script often exits right after it
+        destroys its groups, and a thread still inside a Store call when the
+        interpreter finalizes is ended there, in the middle of torch's C++, which
+        terminates the process ("terminate called without an active exception").
         """
         with self._lock:
             if self._closed:
@@ -325,6 +333,8 @@ class Engine:
         deadline = time.monotonic() + timeout
         for lane in lanes:
             lane.thread.join(max(0, deadline - time.monotonic()))
+        if threading.current_thread() is not self._watcher:
+            self._watcher.join(WATCHER_JOIN)
         self.link.close()
 
 

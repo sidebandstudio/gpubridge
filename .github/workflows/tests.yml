@@ -70,7 +70,9 @@ jobs:
     # The oldest supported torch on the oldest Python, in 3 jobs that each run every
     # third test (GPUBRIDGE_TEST_SHARD, tests/conftest.py), one test at a time as on a
     # developer's machine: many tests start 2 to 4 processes and some time things, so
-    # they don't share a runner's CPUs with each other. The fake-cluster job tests
+    # they don't share a runner's CPUs with each other. A mixed layout that names no
+    # bridge runs on the default, bridge="auto": the Rust TCP bridge, built on first use
+    # with the runner's cargo. The fake-cluster job tests
     # (tests/test_gpu_jobs.py) check the GPU kit's shell scripts, not torch, so only
     # the 3.12 jobs run them.
     name: pytest 3.10 (${{ matrix.shard }}/3)
@@ -130,6 +132,35 @@ jobs:
           GPUBRIDGE_REQUIRE_TRITON: "1"
       - if: matrix.shard == 1
         run: python examples/simulate_two_islands.py
+
+  tests-312-gloo:
+    # The same suite with every job that names no bridge on the Gloo bridge
+    # (GPUBRIDGE_BRIDGE=gloo): the default is bridge="auto", a Rust bridge, and Gloo is
+    # opt-in, kept for one release as the reference. Both must pass.
+    name: pytest 3.12, gloo bridge (${{ matrix.shard }}/4)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -c "import os, torch; print(torch.__version__, os.cpu_count(), 'CPUs')"
+      - run: uv pip install -e ".[test]"
+      - run: uv pip install triton
+      - run: pytest --durations=25
+        env:
+          GPUBRIDGE_BRIDGE: gloo
+          GPUBRIDGE_TEST_SHARD: ${{ matrix.shard }}/4
+          GPUBRIDGE_REQUIRE_TRITON: "1"
 
   pytest-310:
     # main's ruleset requires "pytest (3.10)" and "pytest (3.12)"; these two keep
@@ -201,10 +232,10 @@ jobs:
       - run: pytest tests/test_ucx.py -rs
 
   multitcp:
-    # The multitcp bridge transport (docs/RUST_TRANSPORT.md): its Rust crate formatted,
-    # linted and unit-tested, then built through Python and tested between processes
-    # over loopback TCP. The pytest jobs above also run tests/test_multitcp.py where
-    # cargo is installed, as it is on GitHub's Ubuntu runners.
+    # The TCP bridge transport (bridge="tcp", the default without RDMA;
+    # docs/RUST_TRANSPORT.md): its Rust crate formatted, linted and unit-tested, then
+    # built through Python and tested between processes over loopback TCP. The pytest
+    # jobs above run on it too: cargo is installed on GitHub's Ubuntu runners.
     name: multitcp bridge (3.12)
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -266,7 +297,7 @@ jobs:
     # always()` makes it report even then. Skipped counts only when changes found a
     # docs-only change: only the heavy jobs skip, and only then.
     name: ci-ok
-    needs: [changes, docs, tests-310, tests-312, pytest-310, pytest-312, ucx, multitcp, verbs]
+    needs: [changes, docs, tests-310, tests-312, tests-312-gloo, pytest-310, pytest-312, ucx, multitcp, verbs]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

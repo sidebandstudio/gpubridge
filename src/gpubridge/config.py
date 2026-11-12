@@ -42,16 +42,32 @@ PINNED_STAGING_ENV = "GPUBRIDGE_PINNED_STAGING"
 BRIDGE_COMPRESSION_ENV = "GPUBRIDGE_BRIDGE_COMPRESSION"
 BRIDGE_COMPRESSION_MODES = ("bf16", "fp8")
 
-#: Under the torch.distributed backend (``init_process_group(backend="gpubridge")``)
-#: only: the collective policy and the bridge transport, which ``gpubridge.init()``
-#: takes as arguments. Default ``auto`` and ``gloo``; must match on every rank.
+#: The collective policy under the torch.distributed backend
+#: (``init_process_group(backend="gpubridge")``), which ``gpubridge.init()`` takes as an
+#: argument. Default ``auto``; must match on every rank.
 POLICY_ENV = "GPUBRIDGE_POLICY"
+#: The bridge transport: under the torch.distributed backend, and for
+#: ``gpubridge.init()`` when it isn't passed ``bridge=``. Default ``auto`` (``verbs``
+#: where every island leader has a usable RDMA device, else ``tcp``); ``gloo`` asks for
+#: the Gloo bridge, and with it Gloo groups. Must match on every rank.
 BRIDGE_ENV = "GPUBRIDGE_BRIDGE"
 
-#: Backend of the global discovery group and the cross-vendor bridge. Both run on CPU.
+#: Set to ``1`` to let a job that didn't ask for Gloo start at torch's distributed debug
+#: level DETAIL (``TORCH_DISTRIBUTED_DEBUG=DETAIL``), where torch wraps every native
+#: group in a checker that runs on a Gloo helper group: the job then has Gloo groups and
+#: their threads after all, with the exit-abort exposure that comes with them. Without it
+#: such a job is refused at ``init()``. Also ``gpubridge.init(allow_debug_gloo=True)``.
+#: Must match on every rank.
+ALLOW_DEBUG_GLOO_ENV = "GPUBRIDGE_ALLOW_DEBUG_GLOO"
+
+#: torch's CPU backend: ``bridge="gloo"``'s groups, the ``flat-gloo`` policy's, and
+#: islands of several ranks in CPU simulation. No other job creates a group on it.
 CPU_BACKEND = "gloo"
 #: Backend of islands on real GPUs. On ROCm builds of PyTorch, "nccl" runs RCCL.
 GPU_BACKEND = "nccl"
+#: Backend of a one-rank island in CPU simulation on a bridge other than Gloo: a Python
+#: group with nothing behind it (:class:`gpubridge.torch_backend.SoloGroup`).
+SOLO_BACKEND = "gpubridge_solo"
 
 
 def _flag(name: str) -> bool:
@@ -84,6 +100,15 @@ def pinned_staging_setting() -> bool:
         ValueError: if the variable holds something other than a boolean word.
     """
     return _flag(PINNED_STAGING_ENV)
+
+
+def allow_debug_gloo_setting() -> bool:
+    """Return True when ``GPUBRIDGE_ALLOW_DEBUG_GLOO`` is set to a true value.
+
+    Raises:
+        ValueError: if the variable holds something other than a boolean word.
+    """
+    return _flag(ALLOW_DEBUG_GLOO_ENV)
 
 
 def bridge_compression_setting() -> str:
@@ -185,7 +210,8 @@ class Config:
     """How this process communicates, resolved once by :func:`gpubridge.init`."""
 
     simulated: bool
-    """True on CPU with Gloo islands: simulation mode or CPU-only mode."""
+    """True on CPU, in simulation mode or CPU-only mode: islands are then Gloo groups
+    (one-rank islands on a bridge other than Gloo: no backend at all)."""
     island_backend: str
     device: torch.device
 

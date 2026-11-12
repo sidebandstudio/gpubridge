@@ -168,8 +168,13 @@ def _check_accumulation(topology, shares, k):
     # One exchange per optimizer step, not one per micro-batch, every bucket of it
     # through gpubridge.
     assert exchanges[0] == STEPS
-    assert STEPS <= len(keep.records) <= STEPS * len(list(model.parameters()))
-    assert {(r.op, r.reduce_op) for r in keep.records} == {("all_reduce", "avg")}
+    # (On a bridge other than Gloo the default group is gpubridge's own, so DDP's own
+    # broadcast of its rebuilt buckets after the first step is observed too.)
+    reduces = [r for r in keep.records if r.op == "all_reduce"]
+    assert STEPS <= len(reduces) <= STEPS * len(list(model.parameters()))
+    assert {r.reduce_op for r in reduces} == {"avg"}
+    assert {r.op for r in keep.records} <= ({"all_reduce", "broadcast"} if topology.gloo_free
+                                            else {"all_reduce"})
     # Without no_sync every micro-batch's backward exchanges: the count tells.
     x, w = full_batch(n, STEPS)
     for xs, ws in train_bench.micro_batches([tuple(mine(shares, rank, x, w))], micro)[0]:

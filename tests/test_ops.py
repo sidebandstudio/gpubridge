@@ -9,8 +9,7 @@ from functools import partial
 
 import pytest
 import torch
-import torch.distributed as dist
-from _harness import expected_sum, rank_tensor, run_ranks
+from _harness import expected_sum, gather, rank_tensor, run_ranks  # noqa: F401 - gather: others import it from here
 from _transports import STORE_ENV, StoreTransport
 from test_policies import BUILTIN, LAYOUTS, layout_of
 
@@ -33,12 +32,6 @@ def cases():
         for name in names:
             expected = choose_policy(resolve_policy(name), layout).name
             yield pytest.param(vendors, split, name, expected, id=f"{layout_id}-{name}")
-
-
-def gather(value):
-    out = [None] * dist.get_world_size()
-    dist.all_gather_object(out, value)
-    return out
 
 
 def expected_reduce(shape, dtype, world, op):

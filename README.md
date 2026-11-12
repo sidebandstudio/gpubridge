@@ -15,14 +15,18 @@ on one node of four V100s: two 2-GPU NCCL islands joined by the Gloo bridge,
 and by the opt-in verbs bridge on real libibverbs through one InfiniBand HCA in
 loopback, staged through host memory. Not yet: verbs between machines, AMD or
 mixed-vendor verbs, GPU memory direct to the NIC (GPUDirect), or more than four
-GPUs. The [CHANGELOG](CHANGELOG.md) lists every GPU run,
+GPUs. **Since 2026-11-11 a job creates no Gloo process group unless it asks for
+one (or accepts torch's own at its debug level DETAIL, which is otherwise
+refused), and the default bridge is one of the Rust bridges (`bridge="auto"`):
+that change is tested on CPU only and has not run on a GPU**
+([what changed](#the-default-bridge-and-gloo)). The [CHANGELOG](CHANGELOG.md) lists every GPU run,
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md#split-test-results-2026-10-20)
 what each one showed, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) what the
 bridge costs.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/architecture-dark.svg">
-  <img alt="An NVIDIA island on NCCL and an AMD island on RCCL, each led by its lowest rank. all_reduce: 1, each island reduces onto its leader; 2, the leaders all_reduce over the bridge (Gloo over TCP through host memory by default, or UCX with RDMA where available, opt-in); 3, each leader broadcasts the result to its island." src="docs/img/architecture-light.svg" width="700">
+  <img alt="An NVIDIA island on NCCL and an AMD island on RCCL, each led by its lowest rank. all_reduce: 1, each island reduces onto its leader; 2, the leaders all_reduce over the bridge (by default a Rust bridge through host memory: RDMA verbs where every leader has a usable device, else TCP; Gloo and UCX are opt-in); 3, each leader broadcasts the result to its island." src="docs/img/architecture-light.svg" width="700">
 </picture>
 
 ## Quickstart
@@ -60,11 +64,11 @@ its own vendor. No GPUs? See [Simulation mode](#simulation-mode-no-gpus-needed).
 | Collectives: `all_reduce`, `broadcast`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `barrier` | tested on CPU · passed on a V100 + MI50, one GPU each, and in split tests (two processes on one NVIDIA or AMD GPU, labeled as two vendors), and with two 2-GPU NCCL islands of V100s on one node (`c92684b`) |
 | Async collectives (`async_op=True`) and a DDP comm hook | tested on CPU · passed on a V100 + MI50; DDP with the hook trained there with torch 2.9.1+rocm6.3 on the MI50 |
 | `torch.distributed` backend: DDP, FSDP2, HSDP through subgroups | experimental · tested on CPU · DDP and FSDP2 trained on a V100 + MI50 (torch 2.9.1+rocm6.3 on the MI50), FSDP2 bit for bit against a replay; HSDP passed there with torch 2.14.1 on the V100 (since #80); with two 2-GPU V100 islands (`c92684b`), DDP trained and FSDP2 and HSDP matched a replay bit for bit |
-| Point-to-point through the backend: `send`, `recv`, `isend`, `irecv`, `batch_isend_irecv` | experimental · tested on CPU · passed on a V100 + MI50, on a V100 split test (commit 1c7d107) and with two 2-GPU V100 islands (`c92684b`, all 66 benchmark payload rows), through the Gloo link; not yet the UCX lanes, verbs or native GPU batches |
+| Point-to-point through the backend: `send`, `recv`, `isend`, `irecv`, `batch_isend_irecv` | experimental · tested on CPU · passed on a V100 + MI50, on a V100 split test (commit 1c7d107) and with two 2-GPU V100 islands (`c92684b`, all 66 benchmark payload rows), through the Gloo link (`bridge="gloo"`); not yet the TCP lanes the default bridge uses, the UCX lanes, verbs or native GPU batches |
 | Pipelined and sharded bridge policies | opt-in · tested on CPU · correct and benchmarked on a V100 + MI50 (one GPU each, so the sharded bridge had one link); correct with two links on two 2-GPU V100 islands (`c92684b`), where pipelining helped the Gloo bridge from 1 to 256 MiB and generally slowed the verbs bridge |
 | UCX bridge transport (RDMA where available) | opt-in · tested on CPU over TCP · not yet on GPU or RDMA |
-| Multi-stream TCP bridge transport (Rust) | opt-in · tested on CPU over loopback TCP · between two machines it missed its own speed gate against the pinned Gloo bridge (docs/BENCHMARKS.md), so the prototype stops there |
-| Raw-verbs bridge transport (Rust, libibverbs) | opt-in · tested on mock fabrics · on one node through one InfiniBand HCA in loopback, with real libibverbs: GPU tensors staged through host memory and host tensors exact, and the no-silent-TCP gate passed (`4ffcf93`); not yet between machines, on AMD, GPU memory direct or point-to-point |
+| TCP bridge transport (Rust, `bridge="tcp"`, several connections per pair) | what the default (`auto`) runs on without RDMA · tested on CPU over loopback TCP, where it reproduces the Gloo bridge's results bit for bit (`tests/test_parity_fixture.py`) · between two machines (a V100 and an MI50, two jobs, as `multitcp`) it took 0.88 to 1.07 times the pinned Gloo bridge's time (docs/BENCHMARKS.md): the same speed, not faster · as the default, with gpubridge's own default group, not yet on GPUs |
+| Raw-verbs bridge transport (Rust, libibverbs) | what the default (`auto`) picks where every island leader has a usable RDMA device on one link layer, or by name · tested on mock fabrics · on one node through one InfiniBand HCA in loopback, with real libibverbs: GPU tensors staged through host memory and host tensors exact, and the no-silent-TCP gate passed (`4ffcf93`); not yet between machines, on AMD, GPU memory direct or point-to-point |
 | bf16 / fp8 bridge compression with Triton kernels | opt-in · kernels match the CPU reference on V100, H200 and MI50 (on the MI50 with Triton 3.8.0; torch 2.9.1+rocm6.3's own Triton 3.5.1 can't compile them); benchmarked on a V100 + MI50 |
 | GPU validation kit: Slurm job scripts, checks, benchmarks | every script runs end to end on CPU against a fake Slurm · run on Explorer: steps 01, 02, `amd`, 07, 08, the network checks and the training benchmarks; on 2026-10-20, step 04's split-test checks and the verbs kit on one 4-V100 node; not steps 03, 05 and 06 |
 
@@ -80,8 +84,9 @@ belongs to exactly one vendor. gpubridge groups processes by vendor:
   backend. That is NCCL on NVIDIA, and RCCL on AMD, which ROCm builds of
   PyTorch still call `"nccl"`.
 - **Bridge:** a CPU link between one **leader** per island, where the leader
-  is the island's lowest global rank. By default it is a Gloo process group;
-  the transport can be swapped (see [Bridge transports](#bridge-transports)).
+  is the island's lowest global rank. By default it is one of gpubridge's Rust
+  bridges, RDMA verbs or TCP, chosen once at `init()`; the transport can be
+  swapped (see [Bridge transports](#bridge-transports)).
 
 **`all_reduce`** uses reduce-bridge-broadcast (the diagram above):
 
@@ -105,8 +110,10 @@ links at once), never what a collective computes, and `auto` never picks them.
 
 `gpubridge.init()` does the following:
 
-1. Creates the default process group on **Gloo** across all ranks. NCCL cannot
-   span both vendors, so this CPU group handles discovery and `barrier`.
+1. Opens the job's c10d store, the key-value server `torch.distributed` uses
+   for its own rendezvous. NCCL cannot span both vendors, so what must cross
+   every rank before the islands exist (discovery, and later `barrier`) goes
+   through the store. No Gloo group is created for it.
 2. Each rank detects its vendor from `torch.version.hip` (AMD) or
    `torch.version.cuda` (NVIDIA), and runs `gpubridge.probe()`, which never
    raises: build, visible GPUs, and whether the NCCL and Gloo backends exist.
@@ -115,18 +122,75 @@ links at once), never what a collective computes, and `auto` never picks them.
    of being raised on that rank alone. `torch.cuda.set_device` waits until
    discovery has passed, so a bad device index can't crash one rank and leave
    the rest waiting in rendezvous.
-3. Every rank shares its vendor, probe, problems, hostname and chosen bridge
-   transport with `all_gather_object`. If any rank reported a problem, or the
-   ranks disagree on CPU versus GPU mode or on the bridge transport, `init()`
-   raises the same error on every rank, listing every problem. Nobody is left
-   waiting for a rank that already gave up.
-4. Each rank computes the same islands, leaders and bridge from that shared
-   map. If two ranks of one island would drive the same GPU (compared by UUID
+3. Every rank writes its vendor, probe, problems, hostname and the bridge
+   transport it asked for under a key in the store, and reads every rank's
+   record. If any rank reported a problem, or the ranks disagree on CPU versus
+   GPU mode or on the bridge transport, `init()` raises the same error on every
+   rank, listing every problem; a rank that never reports is named when the
+   timeout passes. Nobody is left waiting for a rank that already gave up.
+   Each rank then marks in the store that it has read the records. When they
+   make the job fail (here or in step 5's checks, which run before any group
+   exists), rank 0 waits for the other ranks' marks before it raises: under a
+   `tcp://` or plain `env://` rendezvous the store's server lives in rank 0,
+   and a rank 0 that left first would leave a slower rank with a network error
+   instead of the reason. What that gives, and where it stops: refusals
+   decided from the discovery records have the same `RuntimeError` text on
+   ranks that read those records; a rank with a malformed local setting keeps
+   its original exception (a `ValueError`). Rank 0 waits for other ranks' read
+   marks only until its original discovery deadline (the one `timeout` counted
+   from when discovery began, not a second one). If that deadline expires
+   first, it logs the unread ranks when the store permits, then raises the
+   original refusal; a reader still delayed at that point can instead receive
+   a store error when the owner exits, even if it is alive and connected. The
+   deadline bounds polling, not synchronous store calls or total init time. A
+   job that starts pays one more store write per rank and waits for no mark.
+   Not covered: failures later in `init()`, such as a bridge that cannot
+   connect. And it needs
+   discovery keys no earlier job wrote: a fresh store per job, or a namespace
+   per job or attempt, as a launcher gives. Starting a new job on a persistent
+   store under a prefix an earlier job used is not supported.
+4. The default process group is created: gpubridge's own (a
+   `GpubridgeProcessGroup`, as under `backend="gpubridge"`), so
+   `torch.distributed` calls on it run through gpubridge. Only `bridge="gloo"`
+   makes it a Gloo group of every rank, as it was through 0.4.0-alpha.
+5. Each rank computes the same islands, leaders and bridge from that shared
+   map. With `bridge="auto"` the island leaders report whether the verbs bridge
+   could run on their RDMA device, and every rank reads the same reports and
+   picks the same bridge: `verbs` if all can and they are on one link layer,
+   else `tcp`. If two ranks of one island would drive the same GPU (compared by UUID
    and PCI address), `init()` raises on every rank, since NCCL and RCCL refuse
    that. If a GPU reports neither (some ROCm builds), rank 0 warns that its
-   island goes unchecked instead. Every rank calls `new_group` for every group
-   in the same order, as `torch.distributed` requires, and the bridge
-   transport is created the same way.
+   island goes unchecked instead. The ranks create the groups in the same
+   order, each group by its own members, and the bridge transport is created
+   the same way.
+
+**torch's debug level DETAIL.** With `TORCH_DISTRIBUTED_DEBUG=DETAIL` (or
+`torch.distributed.set_debug_level`) torch wraps every NCCL, RCCL or Gloo group
+it creates in a checker that runs on a Gloo helper group of the same ranks. A
+job that didn't ask for Gloo would get Gloo groups and their worker threads
+back that way, with the exit abort they can cause on Python 3.12. So `init()`
+refuses such a job on every rank, with one message, before any island group
+exists. Either lower the debug level (`INFO` keeps torch's other debug output),
+or accept the helper groups and that exposure for the job:
+`gpubridge.init(allow_debug_gloo=True)`, or `GPUBRIDGE_ALLOW_DEBUG_GLOO=1`
+(which also serves `init_process_group(backend="gpubridge")`), the same on
+every rank. gpubridge never changes the debug level. A level raised after
+`init()` is not seen, except when a subgroup is set up later; a job on
+`bridge="gloo"` is not checked. Tested on CPU, where simulation's Gloo islands
+stand in for NCCL ones; that torch treats an NCCL group the same way is read
+from its source (2.8.0 and 2.15.0), not shown on a GPU.
+
+A script that returns without calling `destroy()` is covered at a normal
+exit: an exit handler closes the bridge, which joins its native threads,
+before the interpreter finalizes. That is best effort, not a guarantee: it runs
+at interpreter exit (an uncaught exception included) but not after `os._exit`,
+SIGKILL or a fatal abort; handlers registered after gpubridge was imported run
+before it; and it is not bounded in time. Draining pending work and the TCP
+bridge's accepting thread have deadlines (10 s or less), but the bridges'
+sending, receiving and completion threads are then joined without one, because
+they can still touch the caller's memory and are never detached. Closing the
+sockets and a stop flag are what end them; a device call that never returned
+would hold the exit. No teardown fault was injected on hardware.
 
 ## Install
 
@@ -140,6 +204,20 @@ alone. With an older one, pip would replace it with a default build, so
 upgrade it first. Older releases can deadlock while tearing down Gloo groups,
 which [pytorch/pytorch#154976](https://github.com/pytorch/pytorch/pull/154976)
 fixed in 2.8. CI tests 2.8.0 on Python 3.10 and the newest release on 3.12.
+
+**The default bridge needs its Rust library** on the island leaders of a mixed
+job (a single-vendor job has no bridge and needs none). Nothing is compiled at
+install time: the library is built with cargo the first time a bridge is set
+up, or ahead of time, once per kind of machine:
+
+```bash
+python -m gpubridge.multitcp build   # the TCP bridge; needs cargo, no network
+python -m gpubridge.verbs build      # the verbs bridge; needs cargo and rdma-core's headers
+```
+
+`GPUBRIDGE_MULTITCP_LIB` and `GPUBRIDGE_VERBS_LIB` name a library built
+elsewhere, for nodes without a Rust toolchain. Without either, `init()` fails
+on every rank and says what is missing; it never falls back to Gloo.
 Opt-in bridge compression runs Triton kernels on GPUs; PyTorch's CUDA and
 ROCm builds for Linux bring Triton with them. Without it, compression falls
 back to slower PyTorch code with the same results.
@@ -166,11 +244,20 @@ back to slower PyTorch code with the same results.
 Set `GPUBRIDGE_VENDOR=nvidia` or `GPUBRIDGE_VENDOR=amd` on a process to fake
 its vendor. With the variable set:
 
-- islands use Gloo instead of NCCL/RCCL, and
+- islands use Gloo instead of NCCL/RCCL (there is no NCCL on CPU; an island
+  of one rank is a plain Python group with nothing behind it, unless the bridge
+  is Gloo), and
 - tensors stay on CPU (`topology.device` is `cpu`).
 
 Everything else is the code path used on real GPUs: discovery, leader
-election, group creation, and reduce-bridge-broadcast. Set the variable on
+election, group creation, and reduce-bridge-broadcast. Simulation is a test
+device: its Gloo islands are the one place a job that didn't ask for Gloo still
+has Gloo groups. Those groups carry torch's exit abort with them (Python 3.12
+with torch 2.10 to 2.15): a simulated rank that still holds its topology, and
+so its island's Gloo group, when the interpreter finalizes can end with signal
+6 after its work is done. A rank that lets go of the topology before it
+returns is not affected: the group then joins its threads first. Set the
+variable on
 every rank or on none; `init()` refuses a mix of CPU and GPU ranks.
 
 `GPUBRIDGE_SIM_HOSTNAME` sets the machine name a simulated rank reports, so
@@ -233,14 +320,14 @@ The API follows `torch.distributed`, always on the world group.
 
 | Function | Description |
 | --- | --- |
-| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge="gloo", policy="auto") -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the bridge transport (a registered name or a `BridgeTransport` subclass) and the [collective policy](#collective-policies) (`"auto"`, a registered name, or a `CollectivePolicy` subclass). Both must be the same on every rank. |
+| `init(init_method=None, *, rank=None, world_size=None, timeout=None, bridge=None, policy="auto", allow_debug_gloo=None) -> Topology` | Join the cluster and build the islands and bridge. Same arguments as `init_process_group`, plus the [bridge transport](#bridge-transports) (`"auto"`, a registered name such as `"tcp"`, `"verbs"` or `"gloo"`, or a `BridgeTransport` subclass; `None` reads `GPUBRIDGE_BRIDGE`, else `"auto"`) and the [collective policy](#collective-policies) (`"auto"`, a registered name, or a `CollectivePolicy` subclass). Both must be the same on every rank. `allow_debug_gloo` (`None` reads `GPUBRIDGE_ALLOW_DEBUG_GLOO`) accepts torch's Gloo helper groups at its debug level DETAIL, which is [refused otherwise](#initialization). |
 | `all_reduce(tensor, op=ReduceOp.SUM, *, async_op=False)` | In-place reduction across all ranks: `SUM`, `AVG`, `MAX` or `MIN`. `AVG` is a SUM divided by the world size, identically on every rank, so it needs a floating-point dtype. |
 | `broadcast(tensor, src, *, async_op=False)` | In-place copy from global rank `src` to all ranks. |
 | `all_gather_into_tensor(output, input, *, async_op=False)` | Every rank's `input`, back to back in global rank order, in `output` (`world_size` times as many elements). |
 | `reduce_scatter_tensor(output, input, op=ReduceOp.SUM, *, async_op=False)` | Rank `r` gets slice `r` of the reduced `input` (`SUM` or `AVG`). |
 | `ddp_comm_hook(state, bucket)` | A DistributedDataParallel communication hook that averages each gradient bucket with an async gpubridge `all_reduce`. See [DistributedDataParallel](#distributeddataparallel). |
-| `barrier(*, async_op=False)` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. |
-| `destroy()` | Tear down every group `init` created. |
+| `barrier(*, async_op=False)` | Wait for all ranks. On GPUs, first waits for this rank's queued GPU work. A counter in the c10d store (a Gloo barrier with `bridge="gloo"`). |
+| `destroy()` | Tear down every group `init` created and close the bridge. A script that never calls it is closed by an exit handler. |
 | `get_topology() -> Topology` | This rank's view of the cluster (see below). |
 | `is_initialized() -> bool` | True between `init` and `destroy`. |
 | `probe() -> Probe` | This process's build vendor, CUDA/HIP versions, visible GPU count, and NCCL/Gloo availability. Never raises; failed checks are listed in `Probe.errors`. Works before `init`. |
@@ -265,8 +352,12 @@ logical OR on both backends.
 (every island, its ranks and leader), `peers`
 (each rank's vendor, hostname, bridge transport and `probe` results),
 `island_group`, `bridge` (the transport linking island leaders), and `policy`
-/ `policy_name` (the active collective policy). `bridge_group` is the bridge's
-process group when the transport has one, as the default Gloo transport does.
+/ `policy_name` (the active collective policy). `bridge_name` is the bridge
+the job runs on and `selection` how `init()` came to it (what was asked for,
+what was chosen and why, and under `auto` each leader's device report).
+`bridge_group` is the bridge's process group when the transport has one, as
+`bridge="gloo"` does; `gloo_free` says the job didn't ask for Gloo, `debug_gloo` that it
+accepted torch's Gloo helper groups at debug level DETAIL all the same.
 
 ### Collective policies
 
@@ -278,7 +369,7 @@ or if the policy doesn't fit the cluster.
 
 Every built-in policy carries every collective and reduction above. MAX and
 MIN over the bridge also need the bridge transport to list them in
-`reduce_ops`, as the default Gloo transport does. A custom policy offers
+`reduce_ops`, as the built-in transports do. A custom policy offers
 `all_gather_into_tensor` and `reduce_scatter_tensor` only if it overrides them;
 otherwise those calls fail on every rank before any communication, naming the
 policies that do.
@@ -287,7 +378,7 @@ policies that do.
 | --- | --- | --- |
 | `reduce-bridge-broadcast` | 2+ islands | island reduce onto each leader, island leaders over the bridge, island broadcast |
 | `native-only` | 1 island | one native NCCL/RCCL (or CPU Gloo) collective |
-| `flat-gloo` | any | every rank copies to CPU and uses the world Gloo group: slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
+| `flat-gloo` | any | every rank copies to CPU and uses a Gloo group of every rank (made for it at `init()`: naming this policy is asking for Gloo): slow but obviously correct, so it's the test reference and a debugging fallback that never touches NCCL/RCCL |
 | `auto` (default) | any | `native-only` for one island, `reduce-bridge-broadcast` otherwise; today's behaviour |
 | `pipelined-reduce-bridge-broadcast` (opt-in, **checked on GPUs, speedup not established**) | 2+ islands | reduce-bridge-broadcast with the leaders' bridge step cut into chunks: on GPUs the copy of chunk k+1 to pinned host memory, the bridge step of chunk k and the copy of chunk k-1 back overlap, ordered with CUDA events. Chunk size: `GPUBRIDGE_CHUNK_BYTES` (default `4M`) |
 | `sharded-bridge` (opt-in, **checked on GPUs, speedup not established**) | 2+ islands | k ranks per island share the bridge step instead of one leader, where k is the size of the smallest island: each island reduce_scatters (or reduces) the tensor onto k ranks, rank j of every island all_reduces segment j over its own bridge link, and each island all_gathers (or broadcasts) the result. With an island of one rank, k is 1 and it is reduce-bridge-broadcast. On CPU it is slower than reduce-bridge-broadcast; GPU numbers are HARDWARE_VALIDATION.md item 21 |
@@ -433,26 +524,29 @@ collective costs.
 
 ### DistributedDataParallel
 
-DDP needs a process group that spans every rank. In a mixed job the only one
-is the Gloo world group `init()` creates, and on its own it would carry every
-gradient over Gloo. Register `gpubridge.ddp_comm_hook` and DDP keeps its
-bucketing and its overlap with backward, while each bucket is averaged by an
-async `gpubridge.all_reduce` under the active policy:
+DDP needs a process group that spans every rank. After `gpubridge.init()`
+that is the default group, which is gpubridge's own, so DDP works on it as it
+is: its gradient buckets and everything else it exchanges run as gpubridge
+collectives. Registering `gpubridge.ddp_comm_hook` is still worth it: DDP keeps
+its bucketing and its overlap with backward, while each bucket is averaged by
+one async `gpubridge.all_reduce` under the active policy:
 
 ```python
 from torch.nn.parallel import DistributedDataParallel
 
 topology = gpubridge.init()
-model = DistributedDataParallel(model.to(topology.device))  # default group: gpubridge's Gloo world
+model = DistributedDataParallel(model.to(topology.device))  # default group: gpubridge's own
 model.register_comm_hook(None, gpubridge.ddp_comm_hook)
 ```
 
 - DDP must span every rank, as gpubridge collectives do.
-- Gloo still carries what DDP does outside the hook: the parameter shape check
-  and the broadcast from rank 0 when DDP wraps the model, and buffer broadcasts
-  before each forward pass with `broadcast_buffers=True` (the default). A
-  model without buffers, or `broadcast_buffers=False`, keeps Gloo out of the
-  training loop.
+- What DDP does outside the hook also goes through gpubridge: the parameter
+  shape check and the broadcast from rank 0 when DDP wraps the model, the
+  broadcast of its rebuilt buckets after the first step, and buffer broadcasts
+  before each forward pass with `broadcast_buffers=True` (the default).
+  Observers see those collectives too. With `bridge="gloo"` the default group
+  is a Gloo group of every rank instead, which carries them, and without the
+  hook every gradient.
 - If a bucket's all_reduce fails, `backward()` raises, and every later
   collective on that rank refuses to start.
 - Tested on CPU, and on a V100 + MI50: the ranks' parameters stayed the same
@@ -477,19 +571,23 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   2.14 and later, installed gpubridge also registers the name when it is
   first asked for (torch's lazy `torch.distributed.backends` entry point), so
   there the import is optional. gpubridge never hooks `import torch`.
-- **Setup.** gpubridge builds its own groups (a Gloo group of every rank, the
-  islands, the bridge) at the first collective, and runs the same discovery
-  checks as `gpubridge.init()`. `GPUBRIDGE_POLICY` and `GPUBRIDGE_BRIDGE` pick
-  the policy and the bridge transport (default `auto` and `gloo`), and the
+- **Setup.** gpubridge builds its own groups (the islands, the bridge) at the
+  first collective, and runs the same discovery checks as `gpubridge.init()`,
+  through the job's c10d store. `GPUBRIDGE_POLICY` and `GPUBRIDGE_BRIDGE` pick
+  the policy and the bridge transport (both `auto` by default), and the
   other `GPUBRIDGE_*` settings apply as usual.
 - **Collectives.** DDP's `allreduce`, `broadcast` and `allgather`, FSDP2's
   all-gathers and reduce-scatters (both torch 2.8's names and 2.14's), their
   coalesced forms and `barrier()` run as gpubridge async collectives, with the
   same stream semantics. Waiting on one also blocks the host, which costs
   FSDP2 some overlap.
-- **CPU tensors.** On GPUs, CPU tensors go to a Gloo group of the backend's
-  own, so it behaves like `"cpu:gloo,cuda:gpubridge"`. Gather and scatter of
-  CPU tensors (`gather_object`, `scatter_object_list`) take that group too.
+- **CPU tensors.** On GPUs, a collective on CPU tensors is staged onto the
+  rank's GPU, carried by the same topology and copied back (not validated on
+  GPUs: HARDWARE_VALIDATION.md item 46). Gather and scatter of CPU tensors
+  (`gather_object`, `scatter_object_list`) run as an all-gather the root keeps
+  and a broadcast each rank takes its row of. Collectives that only copy carry
+  any dtype, as bytes. With `bridge="gloo"` all of these go to a Gloo group of
+  the backend's own instead, as through 0.4.0-alpha.
 - **Subgroups and HSDP.** A subgroup (`new_group`, a dimension of a 2-D
   `DeviceMesh`) gets its own topology over its members at its first
   collective. Single-vendor members run native-only (one NCCL/RCCL call);
@@ -497,13 +595,17 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   below. Tested in simulation only.
 - **Point-to-point.** `send`, `recv` with an explicit source,
   `isend`, `irecv` and `batch_isend_irecv` route within an island to its native
-  group and across islands through a host-staged Gloo link. Call
+  group and across islands through host-staged lanes of the bridge transport:
+  TCP connections on `bridge="tcp"` (what `auto` usually is), a Gloo group on
+  `"gloo"`, UCX on `"ucx"`. The verbs bridge has none yet: with `bridge="verbs"`
+  (or `auto` where it resolves to verbs) cross-island point-to-point is refused
+  with an error that says so. Call
   `dist.barrier()` on the world, and on a subgroup before its first P2P call,
   to finish collective setup. Cross-island tags match independently; repeated
   messages with the same tag, source and destination match in order. See
   [P2P semantics and limits](docs/TORCH_BACKEND.md#point-to-point). Passed on
   a V100 + MI50 and a V100 split test at commit 1c7d107 (HARDWARE_VALIDATION.md
-  item 32).
+  item 32), through the Gloo link; the TCP lanes have run on CPU only (item 47).
   For native GPU peers on torch 2.8, use `gpubridge.batch_isend_irecv(ops)`
   to provide the batch boundary torch does not pass to Python backends.
 - **Not supported**, refused with an error before any communication:
@@ -511,12 +613,17 @@ dist.init_process_group(backend="gpubridge")   # instead of "nccl"
   - reductions other than SUM, AVG, MAX and MIN.
 
   `torch.compile` isn't tested.
-- **One or the other.** Use `gpubridge.init()` or the backend in one process,
-  not both. With the backend, gpubridge's own functions (`gpubridge.all_reduce`,
-  observers, `in_flight()`) work too.
+- **One or the other.** Use `gpubridge.init()` or
+  `init_process_group(backend="gpubridge")` in one process, not both: they are
+  two ways to the same thing. After either, gpubridge's own functions
+  (`gpubridge.all_reduce`, observers, `in_flight()`) and `torch.distributed`
+  calls on the default group both work, on one topology. (`init(bridge="gloo")`
+  is the exception: its default group is a Gloo one, and a group of this backend
+  beside it is refused.)
 - **Status.** Tested on CPU in simulation mode: DDP and FSDP2 train bit for bit
-  like Gloo on integer-valued data, on torch 2.8.0 and 2.14.1. Not validated on
-  GPUs (HARDWARE_VALIDATION.md item 30).
+  like Gloo on integer-valued data, on torch 2.8.0 and 2.15.0. On GPUs with
+  `bridge="gloo"` see HARDWARE_VALIDATION.md item 30; the backend without Gloo
+  groups has not run on GPUs (items 44 to 46).
 - **More:** `examples/ddp_torch_backend.py`, `examples/fsdp2_torch_backend.py`
   and [docs/TORCH_BACKEND.md](docs/TORCH_BACKEND.md).
 
@@ -551,9 +658,67 @@ Two limits (`examples/fsdp2_torch_backend.py --hsdp 2`; docs/TORCH_BACKEND.md,
 ### Bridge transports
 
 The bridge only moves CPU tensors between island leaders, so it can be swapped
-without touching how collectives are composed. Gloo is the default. To use
-something else, subclass `BridgeTransport`, register it, and pass it to `init()`
-on every rank:
+without touching how collectives are composed.
+
+#### The default bridge, and Gloo
+
+`bridge="auto"` is the default. `init()` resolves it once, the same on every
+rank, to one of gpubridge's two Rust bridges:
+
+| `auto` becomes | When | What it is |
+| --- | --- | --- |
+| `"verbs"` | every island leader passes the verbs bridge's own check for a usable RDMA device (the library loads, a device opens, a port is active and has an address), and all leaders are on one link layer | RDMA reliable connections over libibverbs ([below](#the-verbs-bridge-experimental-run-on-one-host-only-over-one-hca-in-loopback)) |
+| `"tcp"` | otherwise: any leader without a usable device, or leaders on InfiniBand and RoCE, which can't connect | several TCP connections per pair of leaders ([below](#the-tcp-bridge)) |
+
+- The choice is a function of the leaders' reports, which every rank reads from
+  the c10d store, so every rank makes the same one. It is recorded in
+  `topology.selection` (what was asked for, what was chosen, why, and each
+  leader's report) and in `topology.bridge.telemetry()["selection"]`, and logged
+  at INFO by the `gpubridge` logger (at WARNING when TCP is chosen although a
+  leader has an RDMA device). It never changes during the job.
+- A bridge asked for by name is never replaced. `bridge="verbs"` where verbs
+  can't run fails `init()` on every rank with the reason; it never drops to TCP.
+  If `auto` chose verbs and its connections then can't be set up, `init()` fails
+  the same way and names `bridge="tcp"`.
+- `GPUBRIDGE_BRIDGE` names the bridge for a script that passes none (and under
+  the torch.distributed backend). Naming one also skips `auto`'s device check,
+  which on a leader with an RDMA device loads the verbs library (building it on
+  first use where cargo is installed) and opens and closes an endpoint.
+- **Gloo is opt-in.** `bridge="gloo"` (a Gloo process group of the leaders, the
+  default through 0.4.0-alpha) stays for one release: it is the reference the other
+  bridges are tested against. Asking for it is the only way a job's default
+  group, barriers and bridge are Gloo groups. Why it stopped being the default:
+  on Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can abort a
+  process at interpreter exit, after training has finished
+  ([docs/RUNTIME_INVENTORY.md](docs/RUNTIME_INVENTORY.md#6-the-gloo-decisions-reversed-2026-11-11)).
+  A job on the Rust bridges has no Gloo group and no Gloo thread, unless it
+  asks for Gloo another way (the `flat-gloo` policy) or accepts torch's debug
+  helpers (`allow_debug_gloo`, [above](#initialization)); the bridges' own
+  threads never touch a Python object.
+- **Same results.** The Rust bridges reproduce the Gloo bridge's results bit for
+  bit: with two bridge members (every NVIDIA + AMD job) on any data, and with
+  more on integers, MAX, MIN, broadcasts and exact sums
+  (`tests/test_parity_fixture.py`: SHA-256 hashes generated once by the Gloo
+  bridge, reproduced in jobs with no Gloo group). A floating-point SUM over
+  three or more members that rounds is added in a ring order that is not
+  Gloo's, and usually differs from it in the last bits (133 of the fixture's
+  160 such cases; the order the ring transports always used). The fixture is
+  all_reduce and broadcast between 2 to 4 one-rank islands on CPU: it says
+  nothing about other collectives, point-to-point, GPU paths, NaN or infinity
+  handling, or speed (the CHANGELOG lists what it leaves out).
+- **A library to build.** A mixed job's island leaders need the TCP bridge's
+  Rust library (built with cargo on first use, or `GPUBRIDGE_MULTITCP_LIB`),
+  where the Gloo bridge needed nothing beyond torch.
+- **What ran where.** As the default, with gpubridge's own default group, the
+  Rust bridges have run on CPU only. Earlier, by name: the TCP bridge between
+  two machines (a V100 and an MI50), the verbs bridge on one node through one
+  InfiniBand adapter in loopback, staged through host memory. Nothing of this
+  change was run on a GPU.
+
+#### Writing a transport
+
+To use something else, subclass `BridgeTransport`, register it, and pass it to
+`init()` on every rank:
 
 ```python
 from gpubridge import BridgeTransport, init, register_transport
@@ -564,7 +729,8 @@ class MyTransport(BridgeTransport):
 
     @classmethod
     def create(cls, ranks, *, timeout=None):
-        # Called on every rank; return an instance on the leaders in `ranks`, None elsewhere.
+        # Called on the ranks that build the topology; return an instance on the
+        # leaders in `ranks`, None elsewhere.
         ...
 
     def all_reduce(self, tensor): ...          # in-place SUM of a CPU tensor
@@ -576,14 +742,16 @@ class MyTransport(BridgeTransport):
 init(bridge="my-transport")  # or init(bridge=MyTransport)
 ```
 
-Every rank reports its transport's name during discovery, so a job where ranks
-picked different transports fails at `init()` instead of hanging. Policies
+Every rank reports the transport it asked for during discovery, so a job where
+ranks picked different transports fails at `init()` instead of hanging. Policies
 with more than one bridge link, such as `sharded-bridge`, make the extra links
 with the same transport through `create_groups`.
 `tests/_transports.py` has a working example that carries the bridge over a
 c10d `FileStore`. A transport that sets `device_tensors = True` also takes GPU
 tensors; the default policy then hands them over without copying to host
-memory first.
+memory first. During setup the default group is gpubridge's own and not yet
+usable: a transport exchanges what it needs through the c10d store
+(`gpubridge.rendezvous`), as the built-in ones do.
 
 #### The UCX bridge (experimental, **not validated on GPUs or RDMA hardware**)
 
@@ -612,13 +780,14 @@ size. On CPU it is tested over UCX's TCP transport with every bridge policy;
 the design, the GPU-memory rules and what's still open are in
 [docs/RDMA_TRANSPORT.md](docs/RDMA_TRANSPORT.md).
 
-#### The multitcp bridge (experimental prototype, **missed its speed gate**)
+#### The TCP bridge
 
-`init(bridge="multitcp")` carries the bridge over several TCP connections per
-pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, default 4), in chunks of
-`GPUBRIDGE_MULTITCP_CHUNK_BYTES` (default `4M`) spread over them; with two
-leaders each chunk is reduced as soon as it has arrived, while the rest are on
-the wire. It is a small Rust library (the standard library only) with a C
+`init(bridge="tcp")`, and what `auto` runs on without RDMA (`"multitcp"` is its
+older name, and its settings keep theirs). It carries the bridge over several
+TCP connections per pair of leaders (`GPUBRIDGE_MULTITCP_STREAMS`, default 4),
+in chunks of `GPUBRIDGE_MULTITCP_CHUNK_BYTES` (default `4M`) spread over them;
+with two leaders each chunk is reduced as soon as it has arrived, while the rest
+are on the wire. It is a small Rust library (the standard library only) with a C
 interface, loaded with ctypes and built on first use with cargo or with:
 
 ```bash
@@ -628,13 +797,22 @@ python -m gpubridge.multitcp info
 
 It takes host tensors only, so GPU tensors are staged exactly as for the Gloo
 bridge. Leaders connect on `GPUBRIDGE_MULTITCP_IFNAME`'s address, else
-`GLOO_SOCKET_IFNAME`'s. On CPU it is tested with every bridge policy at two to
-four leaders, bit for bit against `flat-gloo`. Between a V100 node and an MI50
-node (Explorer's step 08 with `MULTITCP_BRIDGE=1`, two jobs) it did not meet the
-gate set before the runs, at most 0.8 times the pinned Gloo bridge's time from
-64 MB to 1 GB: with pinned staging it took 0.88 to 1.07 times as long, so the
-prototype stops there ([docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)).
-The design and the gate are in [docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
+`GLOO_SOCKET_IFNAME`'s, else the one this machine reaches `MASTER_ADDR` from. It
+creates no process group; its threads (`gb-tcp-accept`, `gb-tcp-send`,
+`gb-tcp-recv`) never call into Python, and closing the bridge joins them.
+Point-to-point across islands runs over connections of its own, one per
+(source, destination, tag). `topology.bridge.telemetry()` reports its address,
+connections, chunk size, members and state. On CPU it is tested with every
+bridge policy at two to four leaders, bit for bit against `flat-gloo`, and
+against the Gloo bridge's hashes. Between a V100 node and an MI50 node
+(Explorer's step 08 with `MULTITCP_BRIDGE=1`, two jobs, before it was the
+default) pinned staging took 0.88 to 1.07 times the pinned Gloo bridge's time
+from 64 MB to 1 GB
+([docs/BENCHMARKS.md](docs/BENCHMARKS.md#a-multi-stream-tcp-bridge-prototype)):
+about Gloo's speed. It missed the gate it was first judged by (0.8 times), which
+asked whether it was a speed-up; it is the default because it has no Gloo
+thread, not because it is faster. The design is in
+[docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
 
 #### The verbs bridge (experimental, **run on one host only, over one HCA in loopback**)
 
@@ -642,7 +820,8 @@ The design and the gate are in [docs/RUST_TRANSPORT.md](docs/RUST_TRANSPORT.md).
 raw libibverbs: a Rust library (a C shim compiled against rdma-core's headers)
 with its own versioned wire protocol of RC sends through registered buffers,
 credits, a completion thread, and RDMA WRITE into memory registered for one
-receive. Linux only, opt-in, for host and GPU tensors:
+receive. Linux only, for host and GPU tensors; by name, or what `auto` chooses
+where every island leader has a usable RDMA device on one link layer:
 
 ```bash
 python -m gpubridge.verbs build   # needs cargo and rdma-core's headers; or set GPUBRIDGE_VERBS_LIB
@@ -650,8 +829,9 @@ python -m gpubridge.verbs info    # loads it; opens no device
 ```
 
 `GPUBRIDGE_VERBS_DEVICE`, `_PORT` and `_GID_INDEX` pick the endpoint (else the
-first active port, by documented rules); if verbs can't run, init fails on
-every rank and says why, and nothing falls back to TCP.
+first active port, by documented rules); if verbs was asked for by name and
+can't run, init fails on every rank and says why, and nothing falls back to
+TCP.
 GPU tensors go direct (their memory registered with the NIC: a dma-buf, else
 NVIDIA peer memory; AMD through ROCr's dma-buf) when every run-time check passes,
 else through a registered pinned buffer on the caller's stream;
@@ -675,7 +855,9 @@ in [docs/VERBS_TRANSPORT.md](docs/VERBS_TRANSPORT.md).
 
 ### Observing collectives
 
-Monitoring or profiling tools can watch every collective on a rank. After each
+Monitoring or profiling tools can watch every collective on a rank
+(`torch.distributed` calls on the default group included: they are gpubridge
+collectives unless the bridge is Gloo). After each
 collective, an observer gets a `CollectiveRecord`:
 
 - `seq`: the collective's number since `init()`, the same on every rank, so
@@ -772,9 +954,14 @@ mixed hardware, such as monitoring or profiling tools:
   each collective, with sequence numbers that match across ranks.
 - [`in_flight()`](#debugging-a-hang) shows which collective, and which step
   of it, each thread is inside right now.
-- Gloo works the same on both vendors and does not touch GPU streams. A tool
-  can create its own Gloo group after `init()` (on every rank, in the same
-  order) to carry monitoring data without disturbing training traffic.
+- The job's c10d store (`torch.distributed.distributed_c10d._get_default_store()`)
+  reaches every rank on both vendors and touches no GPU stream: a tool can
+  exchange its own data through it without disturbing training traffic, as
+  gpubridge's discovery and barrier do (`gpubridge.rendezvous`). A tool that
+  creates a Gloo group of its own for that is asking for Gloo's threads back.
+- `torch.distributed` calls on the default group are gpubridge collectives
+  (unless the bridge is Gloo): observers record them, and they take sequence
+  numbers.
 
 ## Limitations
 
@@ -787,19 +974,29 @@ mixed hardware, such as monitoring or profiling tools:
 - With NaN in the data, `MAX` and `MIN` follow whatever NCCL/RCCL and Gloo do,
   which may differ (HARDWARE_VALIDATION.md item 14).
 - **Cross-vendor bandwidth is limited by design.** By default the bridge
-  copies data to host memory and sends it with Gloo over TCP. The RDMA-based systems
+  copies data to host memory and sends it over TCP (the Rust TCP bridge), or
+  over RDMA from that host copy where every leader has a usable device. The RDMA-based systems
   published in 2026 report much higher cross-vendor bandwidth (see
   [docs/PRIOR_ART.md](docs/PRIOR_ART.md#three-2026-papers-mixed-vendor-collectives-over-rdma)).
   gpubridge trades that for running on stock PyTorch builds over any network.
 - On the default path, cross-vendor traffic goes through one leader per
-  island, its CPU and Gloo, with no chunking, overlap or pinned memory. The
+  island and its CPU, staged in pageable memory, with no overlap of the copies
+  and the bridge. The
   opt-in `pipelined-reduce-bridge-broadcast` and `sharded-bridge` policies
   and `GPUBRIDGE_PINNED_STAGING` address that. On GPUs they have been checked
   and timed only on one V100 + MI50 pair and on two 2-GPU V100 islands of one
   node, where pipelining helped the Gloo bridge from 1 to 256 MiB; no general
   speedup is established (HARDWARE_VALIDATION.md items 17 to 21 and 25). None
-  of them changes the limit above: all still go through host memory and Gloo.
-- The opt-in verbs bridge (`bridge="verbs"`) carries the leaders' step over
+  of them changes the limit above: all still go through host memory. Those
+  GPU checks ran on the Gloo bridge; on the Rust bridges the policies are
+  tested on CPU only.
+- **The default has not run on a GPU.** Since 2026-11-11 a job that doesn't ask
+  for Gloo starts through the c10d store, has gpubridge's own default process
+  group and runs on `bridge="auto"`. That is tested on CPU; what GPUs must
+  still show is HARDWARE_VALIDATION.md items 44 to 50. `GPUBRIDGE_BRIDGE=gloo`
+  gives a job the path that the GPU results in this README were measured on.
+- The verbs bridge (`bridge="verbs"`, or `auto` where every leader has RDMA)
+  carries the leaders' step over
   RDMA instead, but it has run on one host only, over one HCA in loopback, with
   GPU tensors staged through host memory: between machines, on AMD and with GPU
   memory direct to the NIC it is unvalidated (HARDWARE_VALIDATION.md items 38
