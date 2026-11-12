@@ -152,17 +152,20 @@ def init(
     ``allow_debug_gloo``. gpubridge never changes the debug level, and a level raised
     after ``init()`` is seen only when a subgroup is set up.
 
-    What a refusal reaches, and what that rests on. The refusals decided from the
+    What a refusal reaches, and what that rests on. Refusals decided from the
     discovery records (a rank's reported problem, ranks that disagree, the DETAIL
     refusal, two ranks on one GPU, a policy that doesn't fit the layout) are raised
-    before any group exists, as ``RuntimeError`` with the same text, on every rank
-    that is alive and can reach the store; rank 0, which hosts a TCP store, stays
-    until the others have read the records. A rank whose own bridge name, policy name
-    or setting is malformed raises its own exception (a ``ValueError``), and the
-    others ``RuntimeError`` carrying its message. Failures later in ``init()`` (a
+    before any island group exists and have the same ``RuntimeError`` text on ranks
+    that read those records; a rank with a malformed local setting (its own bridge
+    name, policy name or ``GPUBRIDGE_*`` value) keeps its original exception, a
+    ``ValueError``. Rank 0, which hosts a TCP store, waits for other ranks' read marks
+    only until its original discovery deadline. If that deadline expires first, it
+    logs the unread ranks when the store permits, then raises the original refusal; a
+    reader still delayed at that point can instead receive a store error when the
+    owner exits, even if it is alive and connected. The deadline bounds polling, not
+    synchronous store calls or total init time. Failures later in ``init()`` (a
     bridge that cannot connect) are published through the bridge's own keys and are
-    not part of this. It needs a store that answers (``timeout`` bounds the polling,
-    not a store call that never returns) and discovery keys no earlier job wrote: a
+    not part of this. It also needs discovery keys no earlier job wrote: a
     fresh store for the job, or a namespace of its own for each job or attempt, as a
     launcher gives. Starting a new job on a persistent store under a prefix an
     earlier job used is not supported: that job's records and read marks would be

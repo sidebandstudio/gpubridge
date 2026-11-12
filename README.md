@@ -130,19 +130,22 @@ links at once), never what a collective computes, and `auto` never picks them.
    timeout passes. Nobody is left waiting for a rank that already gave up.
    Each rank then marks in the store that it has read the records. When they
    make the job fail (here or in step 5's checks, which run before any group
-   exists), rank 0 stays until every other rank has marked: under a `tcp://`
-   or plain `env://` rendezvous the store's server lives in rank 0, and a
-   rank 0 that left first would leave a slower rank with a network error
-   instead of the reason. A rank that published its record and then vanished
-   holds rank 0 until discovery's own deadline (the one `timeout` counted from
-   when discovery began, not a second one). That deadline is a budget for
-   polling: each look at the store is a blocking call, and a store that stops
-   answering can hold one past it. A job that starts pays one more store write
-   per rank and waits for no mark. What this covers: the refusals decided from
-   the discovery records, which every rank that is alive and can reach the
-   store raises as the same `RuntimeError` (a rank whose own name or setting is
-   malformed raises its own `ValueError`, the others its message). Not failures
-   later in `init()`, such as a bridge that cannot connect. And it needs
+   exists), rank 0 waits for the other ranks' marks before it raises: under a
+   `tcp://` or plain `env://` rendezvous the store's server lives in rank 0,
+   and a rank 0 that left first would leave a slower rank with a network error
+   instead of the reason. What that gives, and where it stops: refusals
+   decided from the discovery records have the same `RuntimeError` text on
+   ranks that read those records; a rank with a malformed local setting keeps
+   its original exception (a `ValueError`). Rank 0 waits for other ranks' read
+   marks only until its original discovery deadline (the one `timeout` counted
+   from when discovery began, not a second one). If that deadline expires
+   first, it logs the unread ranks when the store permits, then raises the
+   original refusal; a reader still delayed at that point can instead receive
+   a store error when the owner exits, even if it is alive and connected. The
+   deadline bounds polling, not synchronous store calls or total init time. A
+   job that starts pays one more store write per rank and waits for no mark.
+   Not covered: failures later in `init()`, such as a bridge that cannot
+   connect. And it needs
    discovery keys no earlier job wrote: a fresh store per job, or a namespace
    per job or attempt, as a launcher gives. Starting a new job on a persistent
    store under a prefix an earlier job used is not supported.

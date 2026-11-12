@@ -703,15 +703,16 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
 def hold_for_readers(store, scope: str, rank: int, world_size: int,
                      deadline: float) -> None:
     """Before this rank raises because of what discovery found: if it may host the
-    job's store, stay until every other rank has read the discovery records, so that a
-    rank that is alive and can reach the store raises the reason too, not a store
-    error (:func:`gpubridge.rendezvous.await_readers`).
+    job's store, wait for the other ranks to have read the discovery records, so that
+    a rank that reads them in time raises the reason too, not a store error
+    (:func:`gpubridge.rendezvous.await_readers`).
 
-    ``deadline`` is discovery's own (:func:`discovery_deadline`), not a new one: the
-    wait for the records and this hold share one budget, so a refused job has ended on
-    rank 0 by the time discovery alone would have timed out. That is a budget for
-    polling: each look at the store is a blocking call, and a store that stops
-    answering can keep one past the deadline.
+    The record wait and this hold share discovery's original deadline, not a new
+    timeout. No additional polling grace is given when the hold starts after that
+    deadline; synchronous store calls can still run past it. (``deadline`` is
+    :func:`discovery_deadline`'s. When it expires with ranks unread, they are logged if
+    the store still answers, and the caller raises its refusal all the same: a reader
+    still delayed then can get a store error when this rank exits.)
 
     Only rank 0 waits: torch's rendezvous starts a TCP store's server there, and
     nowhere else. Where a launcher's agent or a file holds the store the wait is not

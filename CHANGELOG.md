@@ -296,32 +296,35 @@ unless it asks for one.** Read this before upgrading a job.
   Gloo islands standing in for NCCL ones (`tests/test_debug_gloo.py`); that
   torch wraps an NCCL group the same way is read from torch 2.8.0 and 2.15.0,
   not run on a GPU.
-- **A refusal found in discovery reaches every rank that is alive and can
-  reach the store.** A rank that cannot
+- **A refusal found in discovery reaches the ranks that read the discovery
+  records, and rank 0 waits for them to, up to a deadline.** A rank that cannot
   resolve its own settings (an unknown bridge or policy name, a bridge module
   that fails to import, an invalid `GPUBRIDGE_*` value) publishes the error as
   its discovery record before it raises, so the others raise with its message
   instead of waiting for it until the timeout. Each rank marks in the store
   that it has read the records, and when they make the job fail (a problem, a
   mismatch, the DETAIL refusal, two ranks on one GPU, a policy that doesn't
-  fit: all checked before any group exists) rank 0 does not raise until every
-  other rank has marked. Under a `tcp://` or plain `env://` rendezvous the
-  store's server lives in rank 0; without this a slower rank could get a
-  network error from a store that had gone, not the reason
-  (`tests/test_store_owner.py` holds a rank between its write and its reads
-  to show it). A rank that published and then vanished holds rank 0 until
-  discovery's own deadline, the one the wait for the records had, not a second
-  timeout after it; a rank that never published is named at the timeout on
-  every rank, as before. The deadline is a budget for polling: each look at
-  the store is a blocking call, and a store that stops answering can hold one
-  past it. This holds for ranks that are alive and can reach the store, and
-  for discovery keys no earlier job wrote (a fresh store per job, or a
-  namespace per job or attempt): starting a new job on a persistent store
+  fit: all checked before any island group exists; with `gpubridge.init()`
+  before the default group too) rank 0 waits for the other ranks' marks before
+  it raises. Under a `tcp://` or plain `env://` rendezvous the store's server
+  lives in rank 0; without this a slower rank could get a network error from
+  a store that had gone, not the reason (`tests/test_store_owner.py` stops a
+  rank between its write and its reads to show it). The exact promise:
+  refusals decided from the discovery records have the same `RuntimeError`
+  text on ranks that read those records; a rank with a malformed local setting
+  keeps its original exception (`ValueError`). Rank 0 waits for other ranks'
+  read marks only until its original discovery deadline, the one the wait for
+  the records had, not a second timeout after it. If that deadline expires
+  first, it logs the unread ranks when the store permits, then raises the
+  original refusal; a reader still delayed at that point can instead receive
+  a store error when the owner exits, even if it is alive and connected. The
+  deadline bounds polling, not synchronous store calls or total init time. A
+  rank that never published is named at the timeout on every rank, as before.
+  It also needs discovery keys no earlier job wrote (a fresh store per job, or
+  a namespace per job or attempt): starting a new job on a persistent store
   under a prefix an earlier job used is not supported, as that job's records
-  and read marks would be taken for the new one's. The rank with the malformed
-  setting keeps its own exception type (`ValueError`); "the same message"
-  means the `RuntimeError` text of the refusals decided from the discovery
-  records. A job that starts pays one more store
+  and read marks would be taken for the new one's. A job that starts pays one
+  more store
   write per rank and waits for no mark. Not covered: failures after discovery
   (a bridge that cannot connect is published through the bridge's own status
   keys, as before).

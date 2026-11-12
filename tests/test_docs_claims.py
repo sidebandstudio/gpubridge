@@ -95,19 +95,33 @@ def test_the_shared_refusal_is_stated_with_what_it_covers_and_rests_on():
     doc = " ".join(gpubridge.init.__doc__.split())
     readme, changelog = _text(ROOT / "README.md"), _text(ROOT / "CHANGELOG.md")
     for where, text in (("init()", doc), ("README", readme), ("CHANGELOG", changelog)):
-        for pattern in (r"alive and can reach the store",
+        for pattern in (r"same ``?`?RuntimeError``?`? text on ranks that read those records",
+                        r"keeps its original exception",
+                        # The finite hold, where it is promised: rank 0 waits only
+                        # until discovery's own deadline, and a reader still delayed
+                        # then can get a store error although alive and connected.
+                        r"waits for other ranks' read marks only until its original "
+                        r"discovery deadline",
+                        r"logs the unread ranks when the store permits, then raises the "
+                        r"original refusal",
+                        r"reader still delayed at that point can instead receive a store "
+                        r"error when the owner exits, even if it is alive and connected",
+                        r"deadline bounds polling, not synchronous store calls or total "
+                        r"init time",
                         r"no earlier job wrote",
                         r"fresh store",
                         r"persistent store under a prefix an earlier job used is not supported",
                         r"ValueError",                   # the malformed rank's own type
                         r"bridge that cannot connect"):  # later failures: not covered
             assert re.search(pattern, text), f"{where}: {pattern}"
-    # The wait is a polling budget on discovery's own deadline, not a second timeout
-    # and not a bound on a store call.
-    for where, text in (("README", readme), ("CHANGELOG", changelog)):
-        assert "budget for polling" in text and "blocking call" in text, where
+        # And nowhere the unconditional version: delivery to every live rank.
+        assert "every rank that is alive and can reach the store" not in text, where
+        assert "stays until the others have read" not in text, where
     hold = " ".join((gpubridge.topology.hold_for_readers.__doc__ or "").split())
-    assert "not a new one" in hold and "budget for polling" in hold
+    assert ("The record wait and this hold share discovery's original deadline, not a new "
+            "timeout. No additional polling grace is given when the hold starts after that "
+            "deadline; synchronous store calls can still run past it.") in hold
+    assert "has ended on rank 0 by the time" not in hold
     readers = " ".join((gpubridge.rendezvous.await_readers.__doc__ or "").split())
     for phrase in ("no generation", "such reuse is not supported", "bounds the polling, not "
                    "each call"):
