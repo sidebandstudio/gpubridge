@@ -1,8 +1,11 @@
 """Startup and barriers through torch's c10d store, with no process group.
 
-On a bridge other than Gloo gpubridge creates no Gloo group
-(docs/RUNTIME_INVENTORY.md, section 6), so nothing can carry a collective before the islands and the bridge
-exist. What has to cross ranks before then goes through the job's c10d store, the
+Nothing here creates a process group, of Gloo's or any other backend's. Discovery runs
+before any group exists, and a job that didn't ask for Gloo has none to carry a
+collective before its islands and bridge exist. (Which jobs do ask, by bridge, policy
+or simulation, and the one way torch itself can add Gloo, its debug level DETAIL, are
+in docs/RUNTIME_INVENTORY.md, section 6.) What has to cross ranks before then goes
+through the job's c10d store, the
 key-value server ``torch.distributed`` starts for its own rendezvous (a TCPStore
 under torchrun, a FileStore for ``file://``), the way the bridges already exchange
 their addresses:
@@ -10,7 +13,9 @@ their addresses:
 - :func:`open_store` makes the store ``init_process_group`` would have made, so
   discovery can run before the default group exists and decide what it is;
 - :func:`exchange` publishes one record per rank and reads every rank's, with a
-  deadline;
+  deadline, and then says that it has read them;
+- :func:`await_readers` keeps the rank that hosts the store there until every rank has
+  said so, when what they read makes the job fail;
 - :func:`barrier` is a counter every rank adds to and then watches.
 
 Every wait has a deadline and names what it was waiting for. Nothing here starts a
@@ -38,6 +43,11 @@ BARRIER_POLL_FIRST, BARRIER_POLL_MAX = 50e-6, 0.002
 #: The version of the discovery record. Ranks on a gpubridge that writes another fail
 #: ``init()`` on every rank that reads it, instead of misreading each other.
 RECORD_VERSION = 1
+
+#: A seam for tests, never set by gpubridge: called by :func:`exchange` as
+#: ``_after_publish(prefix, rank)`` once this rank's record is in the store and before
+#: it reads anyone's. A test holds a rank there to pin an interleaving of two ranks.
+_after_publish: Callable[[str, int], None] | None = None
 
 
 def open_store(init_method: str | None, rank: int | None, world_size: int | None,
@@ -100,17 +110,57 @@ def exchange(store, prefix: str, rank: int, size: int, record: dict[str, Any],
 
     Collective over the ``size`` ranks: each calls it once per ``prefix``.
 
+    Once it holds every record, the rank says so with a marker of its own
+    (``<prefix>/read/<rank>``): one more ``set``, which waits for nobody. From then on
+    it needs nothing more from the store to know what the others reported, which is
+    what :func:`await_readers` waits for.
+
     Raises:
         TimeoutError: if a rank's record isn't there by ``deadline``, naming the ranks.
     """
     store.set(f"{prefix}/{rank}", json.dumps(record))
+    if _after_publish is not None:
+        _after_publish(prefix, rank)
     keys = [f"{prefix}/{r}" for r in range(size)]
     try:
-        return [json.loads(value) for value in wait_for(store, keys, deadline, what)]
+        records = [json.loads(value) for value in wait_for(store, keys, deadline, what)]
     except TimeoutError:
         missing = [r for r, key in enumerate(keys) if not store.check([key])]
         raise TimeoutError(f"timed out waiting for {what}: nothing from ranks {missing} of "
                            f"{size}. Did every rank start, with the same gpubridge?") from None
+    store.set(f"{prefix}/read/{rank}", "1")
+    return records
+
+
+def await_readers(store, prefix: str, rank: int, size: int, deadline: float) -> list[int]:
+    """Stay until every other rank has read the records of ``prefix`` (:func:`exchange`'s
+    markers); the ranks that hadn't by ``deadline``, normally none.
+
+    For the rank that hosts the job's store, before it raises because of what the
+    records say. torch's rendezvous starts a TCP store's server inside rank 0 (unless a
+    launcher's agent hosts it), and the server goes when that process does. A rank 0
+    that read the records, raised and left would take the store from a rank that had
+    published but not yet read: that rank would end with a network error from the
+    store instead of the reason every rank is meant to raise. A rank that has written
+    its marker has every record and reads the store no more to decide, so once all
+    markers are in, rank 0 may go.
+
+    Never raises: the caller is about to raise the real reason. A rank that vanished
+    between its record and its marker holds this rank until ``deadline``, the wait the
+    exchange itself had, and no longer.
+    """
+    keys = [f"{prefix}/read/{r}" for r in range(size) if r != rank]
+    pause = WAIT_POLL_FIRST
+    try:
+        while keys and not store.check(keys):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(pause, left))
+            pause = min(2 * pause, WAIT_POLL_MAX)
+        return [int(key.rsplit("/", 1)[1]) for key in keys if not store.check([key])]
+    except Exception:  # noqa: BLE001 - a store that is gone has nobody left to wait for
+        return []
 
 
 def barrier(store, key: str, size: int, deadline: float, *, retire: str | None = None) -> None:

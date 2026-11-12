@@ -659,6 +659,10 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
     describe itself passes ``problem`` instead of ``local``: every rank then raises
     with it, instead of that rank exiting alone and the others waiting.
 
+    A rank that is about to raise because of the records (here, or after
+    :func:`validate_peers` or :func:`check_plan`) first makes sure the others can read
+    them too: :func:`hold_for_readers`.
+
     Raises:
         RuntimeError: if any rank published a problem, or a record of another version.
         TimeoutError: if a rank's record doesn't arrive in ``timeout`` (30 minutes if None).
@@ -677,10 +681,76 @@ def discover(store, scope: str, rank: int, world_size: int, local: PeerInfo | No
                for r, rec in enumerate(records)
                if rec.get("error") or rec.get("v") != _rendezvous.RECORD_VERSION]
     if failing:
+        hold_for_readers(store, scope, rank, world_size, timeout)
         raise RuntimeError(
             f"gpubridge cannot start: {len(failing)} of {world_size} ranks reported "
             "problems.\n" + "\n".join(f"  rank {r}: {p}" for r, p in failing))
     return tuple(PeerInfo.from_wire(rec["peer"]) for rec in records)
+
+
+def hold_for_readers(store, scope: str, rank: int, world_size: int,
+                     timeout: timedelta | None) -> None:
+    """Before this rank raises because of what discovery found: if it may host the
+    job's store, stay until every other rank has read the discovery records, so each
+    of them raises the same reason and none a store error
+    (:func:`gpubridge.rendezvous.await_readers`).
+
+    Only rank 0 waits: torch's rendezvous starts a TCP store's server there, and
+    nowhere else. Where a launcher's agent or a file holds the store the wait is over
+    as soon as the others have read, which they do at once. Called on the failing
+    path only: a job that starts never waits here. Never raises.
+    """
+    if rank != 0:
+        return
+    deadline = time.monotonic() + (timeout or _rendezvous.DEFAULT_TIMEOUT).total_seconds()
+    unread = _rendezvous.await_readers(store, f"gpubridge/{scope}/peer", rank, world_size,
+                                       deadline)
+    if unread:
+        log.warning("gpubridge: ranks %s published a discovery record but had not read the "
+                    "others' when the timeout passed; they may not learn why the job "
+                    "failed", unread)
+
+
+def check_plan(peers: Sequence[PeerInfo], config: Config,
+               policy: str | type[CollectivePolicy],
+               transport: str | type[BridgeTransport], *, rank: int | None = None
+               ) -> tuple[Layout, type[CollectivePolicy]]:
+    """The layout and the policy class the job would run with, or the reason it may not
+    start: every refusal that follows from the ranks' reports alone.
+
+    A pure function of ``peers`` (which :func:`validate_peers` has accepted) and of
+    settings that are the same on every rank, so every rank gets the same answer. It
+    creates nothing and talks to no store: ``init()`` and the backend's setup call it
+    before any group exists, and :func:`build_topology` again when it builds. With
+    ``rank`` it also gives that rank's warnings (the split-test banner, islands whose
+    GPUs go unchecked on rank 0); without, it is silent.
+
+    Raises:
+        RuntimeError: if two ranks of an island would share a GPU, if torch's debug
+            level is DETAIL on a job that neither asked for Gloo nor accepted its
+            helper groups (:func:`debug_gloo_problem`), or if the policy doesn't apply
+            to the layout.
+    """
+    split = peers[0].split_test  # the same on every rank (validate_peers)
+    # validate_peers has ruled out ranks without a vendor.
+    vendors = [cast(str, peer.vendor) for peer in peers]
+    labels = vendors
+    if split:
+        labels = split_labels(vendors, [peer.hostname for peer in peers], split)
+        if rank is not None:
+            warnings.warn(banner(split, vendors, labels), SplitTestWarning, stacklevel=4)
+    layout = plan_topology(labels)
+    gpus = [peer.gpu for peer in peers]
+    unchecked = unchecked_islands(layout, gpus)
+    if unchecked and rank == 0:
+        warnings.warn(_unchecked_warning(unchecked), stacklevel=4)
+    clashes = gpu_clashes(layout, [peer.hostname for peer in peers], gpus)
+    if clashes:
+        raise RuntimeError(_gpu_clash_error(clashes, split))
+    refused = debug_gloo_problem(peers, layout, config, transport)
+    if refused:
+        raise RuntimeError(refused)
+    return layout, choose_policy(policy, layout)
 
 
 def select_bridge(requested: str | type[BridgeTransport], layout: Layout, rank: int,
@@ -774,31 +844,15 @@ def build_topology(
     """
     rank = dist.get_rank()
     peers = tuple(peers)
-    local = peers[rank]
     if not config.simulated:
         # Only now that every rank's device index has passed discovery. Called
         # earlier, an index with no GPU behind it crashed one rank on its own.
         torch.cuda.set_device(config.device)
-    # validate_peers has ruled out ranks without a vendor.
-    vendors = [cast(str, peer.vendor) for peer in peers]
-    labels = vendors
-    if local.split_test:
-        labels = split_labels(vendors, [peer.hostname for peer in peers], local.split_test)
-        warnings.warn(banner(local.split_test, vendors, labels), SplitTestWarning, stacklevel=3)
-    layout = plan_topology(labels)
     # Every rank sees the same layout and peers, so every rank fails these
-    # checks alike (or picks the same policy), before any group is created.
-    gpus = [peer.gpu for peer in peers]
-    unchecked = unchecked_islands(layout, gpus)
-    if unchecked and rank == 0:
-        warnings.warn(_unchecked_warning(unchecked), stacklevel=3)
-    clashes = gpu_clashes(layout, [peer.hostname for peer in peers], gpus)
-    if clashes:
-        raise RuntimeError(_gpu_clash_error(clashes, local.split_test))
-    refused = debug_gloo_problem(peers, layout, config, transport)
-    if refused:
-        raise RuntimeError(refused)
-    policy_cls = choose_policy(policy, layout)
+    # checks alike (or picks the same policy), before any group is created. init()
+    # and the backend's setup have run them once already, before the default group
+    # or anything else existed (check_plan): here they give the layout, and warn.
+    layout, policy_cls = check_plan(peers, config, policy, transport, rank=rank)
     transport, selection = select_bridge(transport, layout, rank, scope, timeout)
     log.info("gpubridge: rank %d of %d, bridge %r (%s)", rank, len(peers), transport.name,
              selection["reason"])

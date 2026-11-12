@@ -128,6 +128,14 @@ links at once), never what a collective computes, and `auto` never picks them.
    GPU mode or on the bridge transport, `init()` raises the same error on every
    rank, listing every problem; a rank that never reports is named when the
    timeout passes. Nobody is left waiting for a rank that already gave up.
+   Each rank then marks in the store that it has read the records. When they
+   make the job fail (here or in step 5's checks, which run before any group
+   exists), rank 0 stays until every other rank has marked: under a `tcp://`
+   or plain `env://` rendezvous the store's server lives in rank 0, and a
+   rank 0 that left first would leave a slower rank with a network error
+   instead of the reason. A rank that published its record and then vanished
+   holds rank 0 until the timeout, no longer. A job that starts pays one more
+   store write per rank and waits for no mark.
 4. The default process group is created: gpubridge's own (a
    `GpubridgeProcessGroup`, as under `backend="gpubridge"`), so
    `torch.distributed` calls on it run through gpubridge. Only `bridge="gloo"`
@@ -671,9 +679,9 @@ rank, to one of gpubridge's two Rust bridges:
   process at interpreter exit, after training has finished
   ([docs/RUNTIME_INVENTORY.md](docs/RUNTIME_INVENTORY.md#6-the-gloo-decisions-reversed-2026-11-11)).
   A job on the Rust bridges has no Gloo group and no Gloo thread, unless it
-  accepts torch's debug helpers (`allow_debug_gloo`,
-  [above](#initialization)); the bridges' own threads never touch a Python
-  object.
+  asks for Gloo another way (the `flat-gloo` policy) or accepts torch's debug
+  helpers (`allow_debug_gloo`, [above](#initialization)); the bridges' own
+  threads never touch a Python object.
 - **Same results.** The Rust bridges reproduce the Gloo bridge's results bit for
   bit: with two bridge members (every NVIDIA + AMD job) on any data, and with
   more on integers, MAX, MIN, broadcasts and exact sums

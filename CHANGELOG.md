@@ -296,6 +296,24 @@ unless it asks for one.** Read this before upgrading a job.
   Gloo islands standing in for NCCL ones (`tests/test_debug_gloo.py`); that
   torch wraps an NCCL group the same way is read from torch 2.8.0 and 2.15.0,
   not run on a GPU.
+- **A refusal found in discovery reaches every rank.** A rank that cannot
+  resolve its own settings (an unknown bridge or policy name, a bridge module
+  that fails to import, an invalid `GPUBRIDGE_*` value) publishes the error as
+  its discovery record before it raises, so the others raise with its message
+  instead of waiting for it until the timeout. Each rank marks in the store
+  that it has read the records, and when they make the job fail (a problem, a
+  mismatch, the DETAIL refusal, two ranks on one GPU, a policy that doesn't
+  fit: all checked before any group exists) rank 0 does not raise until every
+  other rank has marked. Under a `tcp://` or plain `env://` rendezvous the
+  store's server lives in rank 0; without this a slower rank could get a
+  network error from a store that had gone, not the reason
+  (`tests/test_store_owner.py` holds a rank between its write and its reads
+  to show it). A rank that published and then vanished holds rank 0 until the
+  discovery timeout, no longer; a rank that never published is named at the
+  timeout on every rank, as before. A job that starts pays one more store
+  write per rank and waits for no mark. Not covered: failures after discovery
+  (a bridge that cannot connect is published through the bridge's own status
+  keys, as before).
 - **Why.** On Python 3.12 with torch 2.10 to 2.15 a Gloo worker thread can abort
   a process at interpreter exit (signal 6, "terminate called without an active
   exception"), after training has finished; it reproduces with torch alone.

@@ -222,7 +222,15 @@ def init(
     store, rank, world_size = _rendezvous.open_store(init_method, rank, world_size, timeout)
     scope = f"world{next(_torch_backend._world_setups)}"
     peers = _topology.discover(store, scope, rank, world_size, local, timeout)
-    _topology.validate_peers(peers, warn=rank == 0)
+    try:
+        # Everything the ranks' reports alone can refuse, before any group exists: no
+        # store call lies between a rank's reading the reports and its raising here.
+        _topology.validate_peers(peers, warn=rank == 0)
+        _topology.check_plan(peers, config, chosen, transport)
+    except RuntimeError:
+        # If this rank hosts the store, the others must have read the reports first.
+        _topology.hold_for_readers(store, scope, rank, world_size, timeout)
+        raise
 
     kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     gloo = asks_for_gloo(transport)
@@ -250,9 +258,11 @@ def _publish_failure(exc: Exception, init_method: str | None, rank: int | None,
     with this rank's message instead of waiting for a record until their timeout (the
     way the torch.distributed backend's setup has always reported a bad setting).
 
-    This rank takes part in discovery like any other, so it stays until every rank has
-    published (a rank 0 that left at once would take a TCP store with it), or until
-    the timeout if the others never come. Nothing is raised from here: if the job's
+    This rank takes part in discovery like any other: it stays until every rank has
+    published, and if it is rank 0, which hosts a TCP store, until every rank has also
+    read (:func:`gpubridge.topology.hold_for_readers`: a rank 0 that left sooner would
+    take the store, and the reason, with it), or until the timeout if the others
+    never come. Nothing is raised from here: if the job's
     store can't be reached (no rendezvous given, as in a script run by hand), there is
     nobody to tell, and ``init()`` raises ``exc`` either way.
     """

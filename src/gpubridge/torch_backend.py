@@ -959,10 +959,16 @@ def setup(timeout: timedelta | None) -> dist.ProcessGroup | None:
         local, config = _topology.describe_local(transport_name(transport), chosen)
     except Exception as exc:  # noqa: BLE001 - whatever it is, every rank must hear of it
         problem = _topology.failure_text(exc)
-    peers = _topology.discover(_rendezvous.default_store(), scope, dist.get_rank(),
-                               dist.get_world_size(), local, timeout, problem=problem)
+    store, rank, world_size = _rendezvous.default_store(), dist.get_rank(), dist.get_world_size()
+    peers = _topology.discover(store, scope, rank, world_size, local, timeout, problem=problem)
     assert problem is None  # discover() raised on every rank otherwise
-    _topology.validate_peers(peers, warn=dist.get_rank() == 0)
+    try:
+        _topology.validate_peers(peers, warn=rank == 0)
+        _topology.check_plan(peers, config, chosen, transport)
+    except RuntimeError:
+        # As in gpubridge.init(): the rank that hosts the store leaves last.
+        _topology.hold_for_readers(store, scope, rank, world_size, timeout)
+        raise
     return _build(peers, config, transport, chosen, timeout, scope)
 
 
